@@ -1,0 +1,8 @@
+target/
+.idea/
+.bsp/
+.metals/
+*.iml
+.DS_Store
+spark-warehouse/
+artifacts/

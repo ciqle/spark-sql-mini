@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ $# -ne 1 ]]; then
+  echo "Usage: ./bin/run path/to/script.sql" >&2
+  exit 2
+fi
+# Resolve the script before changing directory, so paths work from any directory.
+script_file="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+source "$project_dir/bin/java-env.sh"
+cd "$project_dir"
+./bin/build -q -DskipTests package
+exec java @config/jvm.options -Xmx1g \
+  -Dspark.driver.host=127.0.0.1 -Dspark.driver.bindAddress=127.0.0.1 \
+  -cp "target/classes:$(cat target/classpath.txt)" \
+  dev.sparksqlmini.Main "$script_file"
