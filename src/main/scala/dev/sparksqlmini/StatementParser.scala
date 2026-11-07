@@ -1,28 +1,62 @@
 package dev.sparksqlmini
 
+import java.util.Locale
+
 import dev.sparksqlmini.Statement._
 
 /** Recognizes the outer wrapper syntax; Spark remains responsible for SQL parsing. */
 object StatementParser {
   private val identifier = "[A-Za-z_][A-Za-z0-9_]*"
+  private val qualifiedIdentifier = identifier + "(?:\\s*\\.\\s*" + identifier + ")*"
+  private val featureList = identifier + "(?:\\s*,\\s*" + identifier + ")*"
   private val assignment = ("(?is)^(" + identifier + ")\\s*=\\s*(.*)$").r
   private val insertion = (
-    "(?is)^insert\\s+(" + identifier + ")\\s+into\\s+table\\s+(" +
-      identifier + "(?:\\s*\\.\\s*" + identifier + ")*)\\s*$"
+    "(?is)^insert\\s+(" + identifier + ")\\s+into\\s+table\\s+(" + qualifiedIdentifier + ")\\s*$"
+  ).r
+  private val scoring = (
+    "(?is)^score\\s+(" + qualifiedIdentifier + ")\\s+using\\s+(" + identifier + ")" +
+      "\\s+'([^']*(?:''[^']*)*)'\\s+features\\s*\\(\\s*(" + featureList + ")\\s*\\)" +
+      "\\s+as\\s+(" + identifier + ")$"
   ).r
   private val queryStart = "(?is)^select\\b.*$".r
+  private val scoreStart = "(?is)^score\\b.*$".r
 
   def parse(script: String): Vector[Statement] = {
     require(script != null, "SQL script must not be null")
     splitStatements(script).map {
+      case assignment(name, expression) if scoreStart.matches(expression) =>
+        parseScore(expression, Some(name))
       case assignment(name, query) =>
-        require(queryStart.matches(query), s"Assignment '$name' must contain a SELECT query")
+        require(queryStart.matches(query), s"Assignment '$name' must contain a SELECT query or a SCORE statement")
         AssignTemp(name, query)
       case insertion(source, target) =>
-        InsertTemp(source, target.split("\\s*\\.\\s*").mkString("."))
+        InsertTemp(source, normalizeQualifiedName(target))
+      case sql if scoreStart.matches(sql) =>
+        parseScore(sql, None)
       case sql => SparkSql(sql)
     }
   }
+
+  private def parseScore(sql: String, view: Option[String]): Score = sql match {
+    case scoring(source, backend, modelPath, features, outputColumn) =>
+      require(modelPath.nonEmpty, "SCORE model path must not be empty")
+      Score(
+        normalizeQualifiedName(source),
+        backend.toLowerCase(Locale.ROOT),
+        modelPath.replace("''", "'"),
+        features.split(",").iterator.map(_.trim).toVector,
+        outputColumn,
+        view
+      )
+    case _ =>
+      throw new IllegalArgumentException(
+        "Invalid SCORE syntax. Expected SCORE <source> USING <backend> '<model path>' " +
+          "FEATURES (<column>, ...) AS <output column>"
+      )
+  }
+
+  private def normalizeQualifiedName(name: String): String =
+    name.split("\\s*\\.\\s*").mkString(".")
 
   // A semicolon terminates a statement only outside quoted text and comments.
   private def splitStatements(script: String): Vector[String] = {

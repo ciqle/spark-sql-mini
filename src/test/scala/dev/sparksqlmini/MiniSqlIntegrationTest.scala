@@ -1,11 +1,13 @@
 package dev.sparksqlmini
 
-import java.nio.file.{Files, Path}
+import java.nio.file.{Files, Path, Paths}
 import scala.jdk.CollectionConverters._
+import scala.util.Using
 import org.apache.spark.sql.{AnalysisException, Row, SparkSession}
 import org.apache.spark.sql.types.{LongType, StructField, StructType}
 import org.junit.jupiter.api.{AfterAll, BeforeAll, Test, TestInstance}
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertThrows, assertTrue}
+import dev.sparksqlmini.scoring.OnnxBackend
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class MiniSqlIntegrationTest {
@@ -120,5 +122,56 @@ class MiniSqlIntegrationTest {
                    INSERT INTO with_target SELECT id FROM input;
     """))
     assertEquals(0L, spark.table("with_target").count())
+  }
+
+  @Test
+  def scoresEachRowInFeatureOrderAndWritesTheScoredView(): Unit = {
+    val model = directory.resolve("owner's model; copy.onnx")
+    Files.copy(Paths.get("examples", "models", "linear.onnx"), model)
+    val modelPath = model.toString.replace("'", "''")
+    val results = engine.run(s"""
+      score_input = SELECT id, CAST(id + 1 AS DECIMAL(10, 2)) AS x1,
+                           CAST(3 - id AS DOUBLE) AS x2 FROM range(4);
+      scored = SCORE score_input USING ONNX '$modelPath'
+               FEATURES (X2, x1) AS model_score;
+      CREATE TABLE score_output (id BIGINT, x1 DECIMAL(10, 2), x2 DOUBLE, model_score DOUBLE) USING PARQUET;
+      INSERT scored INTO TABLE score_output;
+      SELECT id, model_score FROM score_output ORDER BY id;
+    """)
+    assertEquals(Vector("id", "x1", "x2", "model_score"), spark.table("scored").columns.toVector)
+    assertEquals(Vector(Row(0L, 5.5), Row(1L, 2.5), Row(2L, -0.5), Row(3L, -3.5)),
+      results.last.collect().toVector)
+  }
+
+  @Test
+  def rejectsInvalidFeatureColumnsAndScoreNameCollisions(): Unit = {
+    engine.run("score_validation = SELECT 1 AS x1, 'text' AS label;")
+    val score = "SCORE score_validation USING ONNX 'examples/models/linear.onnx'"
+    val cases = Vector(
+      (s"$score FEATURES (missing) AS model_score", "does not exist"),
+      (s"$score FEATURES (label) AS model_score", "must be numeric"),
+      (s"$score FEATURES (x1) AS X1", "already exists")
+    )
+    cases.foreach { case (sql, message) =>
+      val error = assertThrows(classOf[IllegalArgumentException], () => engine.run(sql))
+      assertTrue(error.getMessage.contains(message))
+    }
+  }
+
+  @Test
+  def reportsAnOnnxFeatureCountMismatch(): Unit = {
+    val model = Files.readAllBytes(Paths.get("examples", "models", "linear.onnx"))
+    val error = assertThrows(classOf[IllegalArgumentException], () => OnnxBackend.open(model, 1))
+    assertTrue(error.getMessage.contains("expects 2 features, but SCORE supplied 1"))
+  }
+
+  @Test
+  def rejectsValuesOutsideTheOnnxFloatRange(): Unit = {
+    val model = Files.readAllBytes(Paths.get("examples", "models", "linear.onnx"))
+    Using.resource(OnnxBackend.open(model, 2)) { predictor =>
+      val error = assertThrows(classOf[IllegalArgumentException],
+        () => predictor.predict(Array(Double.MaxValue, 0.0)))
+      assertTrue(error.getMessage.contains("ONNX feature 1 must fit in a finite FLOAT32 value"))
+    }
   }
 }

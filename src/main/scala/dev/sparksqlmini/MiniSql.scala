@@ -2,6 +2,7 @@ package dev.sparksqlmini
 
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import dev.sparksqlmini.Statement._
+import dev.sparksqlmini.scoring.TableScoring
 
 /** A tiny interpreter: the SQL body and all query execution belong to Spark. */
 final class MiniSql(val spark: SparkSession) {
@@ -14,6 +15,11 @@ final class MiniSql(val spark: SparkSession) {
     case InsertTemp(source, target) =>
       // INSERT INTO appends to an existing table. Spark handles schema validation.
       spark.sql(s"INSERT INTO ${quote(target)} SELECT * FROM ${quote(source)}")
+
+    case score: Score =>
+      val data = TableScoring.score(spark.table(quote(score.source)), score)
+      score.view.foreach(data.createOrReplaceTempView)
+      data
 
     case SparkSql(sql) =>
       spark.sql(sql)

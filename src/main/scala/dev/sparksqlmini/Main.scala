@@ -35,6 +35,11 @@ object Main {
             println(s"Registered temp view: $name (no show/count/collect)")
           case InsertTemp(source, target) =>
             println(s"Appended $source to $target")
+          case score: Score =>
+            score.view match {
+              case Some(name) => println(s"Registered scored temp view: $name")
+              case None => result.show(truncate = false)
+            }
           case SparkSql(sql) if sql.matches("(?is)^explain\\b.*") =>
             // EXPLAIN is one text column; printing it directly keeps the plan readable.
             result.collect().foreach(row => println(row.getString(0)))
