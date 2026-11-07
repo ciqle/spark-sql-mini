@@ -174,4 +174,82 @@ class MiniSqlIntegrationTest {
       assertTrue(error.getMessage.contains("ONNX feature 1 must fit in a finite FLOAT32 value"))
     }
   }
+
+  @Test
+  def appendsWithStaticAndDynamicPartitionValues(): Unit = {
+    val results = engine.run("""
+      CREATE TABLE partitioned_output (id INT, label STRING, dt DATE, region STRING)
+        USING PARQUET PARTITIONED BY (dt, region);
+      static_rows = SELECT 1 AS id, 'static' AS label;
+      INSERT static_rows INTO TABLE partitioned_output
+        PARTITION (dt = DATE '2026-11-07', region = 'sg');
+      INSERT static_rows INTO TABLE partitioned_output
+        PARTITION (dt = DATE '2026-11-07', region = 'sg');
+      mixed_rows = SELECT 2 AS id, 'mixed' AS label, 'us' AS region;
+      INSERT mixed_rows INTO TABLE partitioned_output PARTITION (dt = DATE '2026-11-08', region);
+      dynamic_rows = SELECT 3 AS id, 'dynamic' AS label, DATE '2026-11-09' AS dt, 'sg' AS region;
+      INSERT dynamic_rows INTO TABLE partitioned_output PARTITION (dt, region);
+      SELECT id, label, CAST(dt AS STRING), region FROM partitioned_output ORDER BY id;
+      SHOW PARTITIONS partitioned_output;
+    """)
+    assertEquals(Vector(
+      Row(1, "static", "2026-11-07", "sg"),
+      Row(1, "static", "2026-11-07", "sg"),
+      Row(2, "mixed", "2026-11-08", "us"),
+      Row(3, "dynamic", "2026-11-09", "sg")
+    ), results(results.size - 2).collect().toVector)
+    assertEquals(Set("dt=2026-11-07/region=sg", "dt=2026-11-08/region=us", "dt=2026-11-09/region=sg"),
+      results.last.collect().map(_.getString(0)).toSet)
+  }
+
+  @Test
+  def joinsLatestEligibleHistoryForEachSampleRow(): Unit = {
+    val results = engine.run("""
+      pit_samples = SELECT * FROM VALUES
+        (1, 10, 'sg', TIMESTAMP '2026-11-07 10:00:00'),
+        (1, 10, 'sg', TIMESTAMP '2026-11-07 10:00:00'),
+        (2, 10, 'sg', TIMESTAMP '2026-11-07 10:30:00'),
+        (3, 10, 'us', TIMESTAMP '2026-11-07 10:30:00'),
+        (4, 20, 'sg', TIMESTAMP '2026-11-07 10:30:00'),
+        (5, NULL, 'sg', TIMESTAMP '2026-11-07 10:30:00'),
+        (6, 10, 'sg', NULL)
+      AS samples(sample_id, customer_id, region, sample_ts);
+      pit_history = SELECT * FROM VALUES
+        (10, 'sg', TIMESTAMP '2026-11-07 09:00:00', 1, 'old'),
+        (10, 'sg', TIMESTAMP '2026-11-07 10:00:00', 1, 'rev1'),
+        (10, 'sg', TIMESTAMP '2026-11-07 10:00:00', 2, 'rev2'),
+        (10, 'sg', TIMESTAMP '2026-11-07 10:30:00', 1, 'exact'),
+        (10, 'sg', TIMESTAMP '2026-11-07 10:45:00', 1, 'future'),
+        (10, 'sg', NULL, 10, 'unknown time'),
+        (10, 'us', TIMESTAMP '2026-11-07 09:00:00', 1, 'other region'),
+        (20, 'sg', TIMESTAMP '2026-11-07 11:00:00', 1, 'future only'),
+        (NULL, 'sg', TIMESTAMP '2026-11-07 09:00:00', 1, 'unknown entity')
+      AS history(entity_id, zone, feature_ts, revision, label);
+      pit_result = PIT JOIN pit_samples WITH pit_history
+        ON (customer_id = entity_id, region = zone)
+        AS OF sample_ts USING feature_ts TIE BREAK BY revision;
+      SELECT sample_id, history_label FROM pit_result ORDER BY sample_id;
+    """)
+    assertEquals(Vector("sample_id", "customer_id", "region", "sample_ts", "history_entity_id",
+      "history_zone", "history_feature_ts", "history_revision", "history_label"),
+      spark.table("pit_result").columns.toVector)
+    assertEquals(Vector(Row(1, "rev2"), Row(1, "rev2"), Row(2, "exact"), Row(3, "other region"),
+      Row(4, null), Row(5, null), Row(6, null)), results.last.collect().toVector)
+  }
+
+  @Test
+  def reportsAnUnresolvedLatestHistoryTieEvenWhenCountingRows(): Unit = {
+    val joined = engine.run("""
+      tie_samples = SELECT 10 AS id, DATE '2026-11-07' AS sample_dt;
+      tie_history = SELECT * FROM VALUES
+        (10, DATE '2026-11-07', 2, 'first'),
+        (10, DATE '2026-11-07', 2, 'second') AS history(id, feature_dt, revision, label);
+      PIT JOIN tie_samples WITH tie_history ON (id = id)
+        AS OF sample_dt USING feature_dt TIE BREAK BY revision;
+    """).last
+    val error = assertThrows(classOf[RuntimeException], () => joined.count())
+    assertTrue(Iterator.iterate[Throwable](error)(_.getCause).takeWhile(_ != null)
+      .exists(e => Option(e.getMessage).exists(message =>
+        message.contains("PIT JOIN") && message.toLowerCase(java.util.Locale.ROOT).contains("tie"))))
+  }
 }

@@ -6,6 +6,16 @@ sealed trait Statement
 object Statement {
   final case class AssignTemp(name: String, query: String) extends Statement
   final case class InsertTemp(source: String, target: String) extends Statement
+  final case class InsertPartition(source: String, target: String, spec: String) extends Statement
+  final case class PitJoin(
+      left: String,
+      right: String,
+      keys: Vector[(String, String)],
+      leftTime: String,
+      rightTime: String,
+      tieBreak: Option[String],
+      view: Option[String]
+  ) extends Statement
   final case class Score(
       source: String,
       backend: String,

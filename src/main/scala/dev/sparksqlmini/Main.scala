@@ -35,9 +35,16 @@ object Main {
             println(s"Registered temp view: $name (no show/count/collect)")
           case InsertTemp(source, target) =>
             println(s"Appended $source to $target")
+          case InsertPartition(source, target, spec) =>
+            println(s"Appended $source to $target with PARTITION ($spec)")
           case score: Score =>
             score.view match {
               case Some(name) => println(s"Registered scored temp view: $name")
+              case None => result.show(truncate = false)
+            }
+          case pit: PitJoin =>
+            pit.view match {
+              case Some(name) => println(s"Registered point-in-time joined temp view: $name")
               case None => result.show(truncate = false)
             }
           case SparkSql(sql) if sql.matches("(?is)^explain\\b.*") =>

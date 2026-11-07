@@ -3,6 +3,7 @@ package dev.sparksqlmini
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import dev.sparksqlmini.Statement._
 import dev.sparksqlmini.scoring.TableScoring
+import dev.sparksqlmini.temporal.PointInTimeJoin
 
 /** A tiny interpreter: the SQL body and all query execution belong to Spark. */
 final class MiniSql(val spark: SparkSession) {
@@ -16,9 +17,17 @@ final class MiniSql(val spark: SparkSession) {
       // INSERT INTO appends to an existing table. Spark handles schema validation.
       spark.sql(s"INSERT INTO ${quote(target)} SELECT * FROM ${quote(source)}")
 
+    case InsertPartition(source, target, spec) =>
+      spark.sql(s"INSERT INTO ${quote(target)} PARTITION ($spec) SELECT * FROM ${quote(source)}")
+
     case score: Score =>
       val data = TableScoring.score(spark.table(quote(score.source)), score)
       score.view.foreach(data.createOrReplaceTempView)
+      data
+
+    case pit: PitJoin =>
+      val data = PointInTimeJoin.join(spark.table(quote(pit.left)), spark.table(quote(pit.right)), pit)
+      pit.view.foreach(data.createOrReplaceTempView)
       data
 
     case SparkSql(sql) =>

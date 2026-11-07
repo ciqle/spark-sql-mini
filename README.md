@@ -1,6 +1,6 @@
 # Spark SQL Mini
 
-这是一个独立的 Scala 学习项目，在 Spark SQL 外面提供临时视图赋值、追加写表和模型评分。
+这是一个独立的 Scala 学习项目，在 Spark SQL 外面提供临时视图赋值、追加写表、模型评分和时点关联。
 
 ```sql
 CREATE TABLE output (id BIGINT) USING PARQUET;
@@ -40,16 +40,61 @@ cd ~/workspace/spark-sql-mini
 | --- | --- |
 | `temp = SELECT ...` | `spark.sql(query).createOrReplaceTempView("temp")` |
 | `INSERT temp INTO TABLE db.output` | `spark.sql("INSERT INTO db.output SELECT * FROM temp")` |
+| `INSERT temp INTO TABLE db.output PARTITION (dt = DATE '2026-11-07')` | 把分区说明交给 Spark，向目标分区追加 |
 | `scored = SCORE source USING ONNX 'model.onnx' FEATURES (x1, x2) AS model_score` | 在 Spark 分区里推断并追加 `model_score`，再将结果注册成 `scored` |
+| `enriched = PIT JOIN samples WITH history ON (id = entity_id) AS OF sample_ts USING feature_ts` | 为每条样本匹配最近的历史记录，再将结果注册成 `enriched` |
 | 普通 `CREATE TABLE`、`SELECT`、`EXPLAIN` 等 | `spark.sql(originalSql)` |
 
-赋值右侧接受 `SELECT` 查询或 `SCORE`。普通 `WITH ... SELECT ...` 可以直接作为原生 SQL 执行。临时视图名和写入源名使用简单英文标识符，如 `temp_1`。目标允许 `output`、`db.output` 等点分名称。普通 SQL 中的标识符、表达式和函数遵循 Spark 本身的规则。
+赋值右侧接受 `SELECT`、`SCORE` 或 `PIT JOIN`。普通 `WITH ... SELECT ...` 可以直接作为原生 SQL 执行。临时视图名和写入源名使用简单英文标识符，如 `temp_1`。目标允许 `output`、`db.output` 等点分名称。普通 SQL 中的标识符、表达式和函数遵循 Spark 本身的规则。
 
 - 同名赋值会替换当前会话中的临时视图；注册视图本身不调用 `show/count/collect`，不自动缓存或物化结果。
 - 包装的 `INSERT` 向**已有表追加**，不会自动建表或覆盖旧数据。列按位置匹配，名称不同不会自动重排；列数、类型、权限等问题交给 Spark 报错。
 - 多条语句在同一会话中按书写顺序执行，遇到错误立即停止。整个脚本不是事务，前面成功的操作不会回滚。
 - 以分号分句，识别单/双引号、反引号、转义、行注释和嵌套块注释；保留 `/*+ ... */` 优化提示。暂不支持包含内部语句分号的 `BEGIN ... END` 等 Spark SQL 脚本块。
-- CLI 展示普通查询和独立 `SCORE` 的结果。赋值时打印临时视图的注册信息，查询或写出会触发视图求值。
+- CLI 展示普通查询及独立 `SCORE`、`PIT JOIN` 的结果。赋值时打印临时视图的注册信息，查询或写出会触发视图求值。
+
+## 分区写入
+
+目标表用 Spark 原生 `PARTITIONED BY` 定义存储分区。包装层将 `INSERT ... PARTITION` 改写为原生 `INSERT INTO ... PARTITION ... SELECT`，由 Spark 校验分区和列的匹配。
+
+```sql
+CREATE TABLE daily_output (id INT, dt DATE, region STRING)
+  USING PARQUET PARTITIONED BY (dt, region);
+
+batch = SELECT 1 AS id, 'sg' AS region;
+INSERT batch INTO TABLE daily_output PARTITION (dt = DATE '2026-11-07', region);
+```
+
+上例固定了 `dt`，而 `region` 取自输入。写入同一分区会追加行。对示例中的 Parquet 表，显式 `PARTITION` 需列出全部分区列。在目标表 `PARTITIONED BY` 定义的顺序中，静态列必须排在动态列之前。输入列按目标表顺序排列，跳过已指定常量的静态列。 [Spark 分区写入实现](https://github.com/apache/spark/blob/v4.2.0/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/DataSourceStrategy.scala#L178)
+
+| 写法 | `daily_output` 所需的输入列，按顺序 |
+| --- | --- |
+| `PARTITION (dt = DATE '2026-11-07', region = 'sg')` | `id` |
+| `PARTITION (dt = DATE '2026-11-07', region)` | `id, region` |
+| `PARTITION (dt, region)` | `id, dt, region` |
+
+## Point-in-Time Join
+
+```sql
+enriched = PIT JOIN samples WITH history
+  ON (customer_id = entity_id)
+  AS OF sample_ts USING feature_ts
+  TIE BREAK BY revision;
+
+SELECT sample_id, history_risk_feature FROM enriched ORDER BY sample_id;
+```
+
+`ON` 中每个等式左边是样本列，右边是历史列。用逗号列出多个键对时，所有键都需匹配。两侧时间列必须同为 `DATE`、`TIMESTAMP` 或 `TIMESTAMP_NTZ`。Spark 按 `feature_ts <= sample_ts` 筛选候选，再选时间最新的一条。空键和空时间不参与匹配。
+
+结果保留每一条左侧样本，包括重复行。右侧列统一加 `history_` 前缀，找不到历史记录时这些列为 `NULL`。如果最新时点有多个候选，可以用 `TIE BREAK BY` 选右侧值最大的一条，空值排在最后。仍并列时会报错。输出列名冲突时需先重命名输入列。
+
+执行层为样本行加临时编号，用 Spark 左连接找出候选，再用按样本编号分组的窗口排序。临时编号仅用于这次计算。 [实现](src/main/scala/dev/sparksqlmini/temporal/PointInTimeJoin.scala)
+
+```bash
+./bin/run examples/pit_partition.sql
+```
+
+示例里，10:00 的样本得到 `0.25`，10:30 的样本得到修订版本 2 的 `0.65`，没有历史的样本得到 `NULL`。最后三行写入 `dt=2026-11-07` 的 Parquet 分区，并用 `SHOW PARTITIONS` 查看分区。 [完整示例](examples/pit_partition.sql)
 
 ## 使用 ONNX 给表评分
 
@@ -74,7 +119,7 @@ SELECT id, model_score FROM scored ORDER BY id;
 
 ## 先读哪几个文件
 
-1. [Statement.scala](src/main/scala/dev/sparksqlmini/Statement.scala) 定义赋值、写入、评分和普通 SQL 对应的语句类型。
+1. [Statement.scala](src/main/scala/dev/sparksqlmini/Statement.scala) 定义包装层和原生 SQL 的语句类型。
 2. [MiniSql.scala](src/main/scala/dev/sparksqlmini/MiniSql.scala)：核心解释器，直接对照上面的语义表阅读。
 3. [StatementParser.scala](src/main/scala/dev/sparksqlmini/StatementParser.scala)：只识别包装语法，不解析 SELECT 内部；分句器避免把字符串中的分号误当分隔符。
 4. [Main.scala](src/main/scala/dev/sparksqlmini/Main.scala)：启动本地 Spark、依次执行、展示结果、关闭会话。

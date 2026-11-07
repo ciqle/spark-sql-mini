@@ -75,6 +75,78 @@ class StatementParserTest {
   }
 
   @Test
+  def parsesAssignedPitJoinWithQualifiedSourcesAndOrderedKeys(): Unit = {
+    val sql = """AsOf = PiT JoIn catalog . db . samples WiTh features . history
+                 |ON (CustomerId = EntityId, tenant = tenant) AS OF sample_ts USING feature_ts
+                 |TIE BREAK BY revision; SELECT * FROM AsOf;""".stripMargin
+    assertEquals(
+      Vector(
+        PitJoin(
+          "catalog.db.samples", "features.history", Vector("CustomerId" -> "EntityId", "tenant" -> "tenant"),
+          "sample_ts", "feature_ts", Some("revision"), Some("AsOf")
+        ),
+        SparkSql("SELECT * FROM AsOf")
+      ),
+      StatementParser.parse(sql)
+    )
+  }
+
+  @Test
+  def parsesStandalonePitJoinWithoutTieBreak(): Unit = {
+    val sql = "PIT JOIN samples WITH history ON (id = entity_id) AS OF sample_ts USING feature_ts"
+    assertEquals(
+      Vector(PitJoin("samples", "history", Vector("id" -> "entity_id"), "sample_ts", "feature_ts", None, None)),
+      StatementParser.parse(sql)
+    )
+  }
+
+  @Test
+  def reportsMalformedPitJoinSyntax(): Unit = {
+    Vector(
+      "PIT JOIN samples WITH history ON () AS OF sample_ts USING feature_ts",
+      "asof = PIT JOIN samples WITH history ON (id = entity_id,) AS OF sample_ts USING feature_ts",
+      "PIT JOIN samples WITH history ON (id = history.entity_id) AS OF sample_ts USING feature_ts",
+      "PIT JOIN samples WITH history ON (id = entity_id) AS OF sample_ts",
+      "PIT JOIN samples WITH history ON (id = entity_id) AS OF sample_ts USING feature_ts TIE BREAK BY r, id"
+    ).foreach { sql =>
+      val error = assertThrows(classOf[IllegalArgumentException], () => StatementParser.parse(sql))
+      assertTrue(error.getMessage.contains("Invalid PIT JOIN syntax"))
+    }
+  }
+
+  @Test
+  def preservesPartitionSpecForSparkIncludingQuotedDelimiters(): Unit = {
+    val spec = "dt = DATE '2026-11-07', note = 'US; East (it''s fine)',\n  region"
+    val sql = s"InSeRt temp InTo TaBlE db . target PaRtItIoN (  $spec  ); SELECT * FROM db.target;"
+    assertEquals(
+      Vector(InsertPartition("temp", "db.target", spec), SparkSql("SELECT * FROM db.target")),
+      StatementParser.parse(sql)
+    )
+  }
+
+  @Test
+  def rejectsEmptyAndMalformedPartitionInsert(): Unit = {
+    val empty = assertThrows(classOf[IllegalArgumentException], () =>
+      StatementParser.parse("INSERT temp INTO TABLE target PARTITION (  )"))
+    assertTrue(empty.getMessage.contains("PARTITION specification must not be empty"))
+
+    val malformed = assertThrows(classOf[IllegalArgumentException], () =>
+      StatementParser.parse("INSERT temp INTO TABLE target PARTITION (dt = '2026-11-07'"))
+    assertTrue(malformed.getMessage.contains("Invalid INSERT syntax"))
+  }
+
+  @Test
+  def doesNotInterceptNativePartitionInsertOrJoin(): Unit = {
+    val insert = "INSERT INTO TABLE target PARTITION (dt = DATE '2026-11-07') SELECT * FROM temp"
+    val overwrite = "INSERT OVERWRITE TABLE target PARTITION (dt = DATE '2026-11-07') SELECT * FROM temp"
+    val query = "SELECT * FROM samples JOIN history ON samples.id = history.entity_id"
+    assertEquals(
+      Vector(SparkSql(insert), SparkSql(overwrite), SparkSql(query)),
+      StatementParser.parse(s"$insert; $overwrite; $query")
+    )
+  }
+
+  @Test
   def acceptsMultilineSelectQueries(): Unit = {
     val query = "SELECT id\nFROM source\nWHERE id > 0"
     assertEquals(Vector(AssignTemp("Result_1", query)), StatementParser.parse(s"Result_1 = $query"))

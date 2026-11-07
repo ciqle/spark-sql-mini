@@ -9,9 +9,18 @@ object StatementParser {
   private val identifier = "[A-Za-z_][A-Za-z0-9_]*"
   private val qualifiedIdentifier = identifier + "(?:\\s*\\.\\s*" + identifier + ")*"
   private val featureList = identifier + "(?:\\s*,\\s*" + identifier + ")*"
+  private val keyPair = identifier + "\\s*=\\s*" + identifier
+  private val joinKeyList = keyPair + "(?:\\s*,\\s*" + keyPair + ")*"
   private val assignment = ("(?is)^(" + identifier + ")\\s*=\\s*(.*)$").r
-  private val insertion = (
-    "(?is)^insert\\s+(" + identifier + ")\\s+into\\s+table\\s+(" + qualifiedIdentifier + ")\\s*$"
+  private val insertTarget =
+    "(?is)^insert\\s+(" + identifier + ")\\s+into\\s+table\\s+(" + qualifiedIdentifier + ")"
+  private val insertion = (insertTarget + "$").r
+  private val partitionInsertion = (insertTarget + "\\s+partition\\s*\\((.*)\\)$").r
+  private val wrapperInsertStart = ("(?is)^insert\\s+" + identifier + "\\s+into\\s+table\\b.*$").r
+  private val pitJoin = (
+    "(?is)^pit\\s+join\\s+(" + qualifiedIdentifier + ")\\s+with\\s+(" + qualifiedIdentifier + ")" +
+      "\\s+on\\s*\\(\\s*(" + joinKeyList + ")\\s*\\)\\s+as\\s+of\\s+(" + identifier + ")" +
+      "\\s+using\\s+(" + identifier + ")(?:\\s+tie\\s+break\\s+by\\s+(" + identifier + "))?$"
   ).r
   private val scoring = (
     "(?is)^score\\s+(" + qualifiedIdentifier + ")\\s+using\\s+(" + identifier + ")" +
@@ -20,21 +29,59 @@ object StatementParser {
   ).r
   private val queryStart = "(?is)^select\\b.*$".r
   private val scoreStart = "(?is)^score\\b.*$".r
+  private val pitJoinStart = "(?is)^pit\\s+join\\b.*$".r
 
   def parse(script: String): Vector[Statement] = {
     require(script != null, "SQL script must not be null")
     splitStatements(script).map {
       case assignment(name, expression) if scoreStart.matches(expression) =>
         parseScore(expression, Some(name))
+      case assignment(name, expression) if pitJoinStart.matches(expression) =>
+        parsePitJoin(expression, Some(name))
       case assignment(name, query) =>
-        require(queryStart.matches(query), s"Assignment '$name' must contain a SELECT query or a SCORE statement")
+        require(
+          queryStart.matches(query),
+          s"Assignment '$name' must contain a SELECT query, SCORE statement, or PIT JOIN statement"
+        )
         AssignTemp(name, query)
+      case partitionInsertion(source, target, spec) =>
+        val partitionSpec = spec.trim
+        require(partitionSpec.nonEmpty, "INSERT PARTITION specification must not be empty")
+        InsertPartition(source, normalizeQualifiedName(target), partitionSpec)
       case insertion(source, target) =>
         InsertTemp(source, normalizeQualifiedName(target))
+      case sql if wrapperInsertStart.matches(sql) =>
+        throw new IllegalArgumentException(
+          "Invalid INSERT syntax. Expected INSERT <source> INTO TABLE <target> [PARTITION (<specification>)]"
+        )
       case sql if scoreStart.matches(sql) =>
         parseScore(sql, None)
+      case sql if pitJoinStart.matches(sql) =>
+        parsePitJoin(sql, None)
       case sql => SparkSql(sql)
     }
+  }
+
+  private def parsePitJoin(sql: String, view: Option[String]): PitJoin = sql match {
+    case pitJoin(left, right, keys, leftTime, rightTime, tieBreak) =>
+      val keyPairs = keys.split(",").iterator.map { pair =>
+        val columns = pair.split("=", 2)
+        (columns(0).trim, columns(1).trim)
+      }.toVector
+      PitJoin(
+        normalizeQualifiedName(left),
+        normalizeQualifiedName(right),
+        keyPairs,
+        leftTime,
+        rightTime,
+        Option(tieBreak),
+        view
+      )
+    case _ =>
+      throw new IllegalArgumentException(
+        "Invalid PIT JOIN syntax. Expected PIT JOIN <left> WITH <right> ON (<left key> = <right key>, ...) " +
+          "AS OF <left time> USING <right time> [TIE BREAK BY <right column>]"
+      )
   }
 
   private def parseScore(sql: String, view: Option[String]): Score = sql match {
