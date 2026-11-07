@@ -3,7 +3,7 @@ package dev.sparksqlmini
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import dev.sparksqlmini.Statement._
 import dev.sparksqlmini.scoring.TableScoring
-import dev.sparksqlmini.temporal.PointInTimeJoin
+import dev.sparksqlmini.temporal.{PointInTimeJoin, TimeSnapshot}
 
 /** A tiny interpreter: the SQL body and all query execution belong to Spark. */
 final class MiniSql(val spark: SparkSession) {
@@ -28,6 +28,11 @@ final class MiniSql(val spark: SparkSession) {
     case pit: PitJoin =>
       val data = PointInTimeJoin.join(spark.table(quote(pit.left)), spark.table(quote(pit.right)), pit)
       pit.view.foreach(data.createOrReplaceTempView)
+      data
+
+    case snapshot: Snapshot =>
+      val data = TimeSnapshot.read(spark.table(quote(snapshot.source)), snapshot)
+      snapshot.view.foreach(data.createOrReplaceTempView)
       data
 
     case SparkSql(sql) =>

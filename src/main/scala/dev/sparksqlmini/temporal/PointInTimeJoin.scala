@@ -1,47 +1,29 @@
 package dev.sparksqlmini.temporal
 
 import org.apache.spark.sql.{Column, DataFrame}
-import org.apache.spark.sql.expressions.Window
-import org.apache.spark.sql.functions.{col, count, dense_rank, lit, monotonically_increasing_id, raise_error, when}
-import org.apache.spark.sql.types.{BooleanType, DateType, StructField, TimestampNTZType, TimestampType}
+import org.apache.spark.sql.functions.{col, lit, make_interval, monotonically_increasing_id, try_add, unix_date}
+import org.apache.spark.sql.types.{DateType, LongType}
 import dev.sparksqlmini.Statement.PitJoin
 
 private[sparksqlmini] object PointInTimeJoin {
-  def join(left: DataFrame, right: DataFrame, statement: PitJoin): DataFrame = {
-    val caseSensitive = left.sparkSession.conf.get("spark.sql.caseSensitive").toBoolean
-    def sameName(first: String, second: String): Boolean =
-      if (caseSensitive) first == second else first.equalsIgnoreCase(second)
+  import HistoryRows._
 
-    val leftSchema = left.schema
-    val rightSchema = right.schema
-    val leftNames = leftSchema.fieldNames.toVector
-    val rightNames = rightSchema.fieldNames.toVector
+  def join(left: DataFrame, right: DataFrame, statement: PitJoin): DataFrame = {
+    val sameName = nameMatcher(left)
+    val leftNames = left.columns.toVector
+    val rightNames = right.columns.toVector
     val outputNames = leftNames ++ rightNames.map(name => s"history_$name")
     val collision = outputNames.find(name => outputNames.count(sameName(name, _)) > 1)
     require(collision.isEmpty, s"PIT JOIN output column '${collision.getOrElse("")}' is ambiguous. Rename a column first.")
 
-    def field(fields: Array[StructField], name: String, side: String): StructField = {
-      val matches = fields.filter(candidate => sameName(candidate.name, name))
-      require(matches.nonEmpty, s"PIT JOIN $side column '$name' does not exist")
-      require(matches.length == 1, s"PIT JOIN $side column '$name' is ambiguous")
-      matches.head
-    }
-
-    val leftTime = field(leftSchema.fields, statement.leftTime, "sample")
-    val rightTime = field(rightSchema.fields, statement.rightTime, "history")
+    val leftTime = field(left, statement.leftTime, "PIT JOIN sample")
+    val rightTime = field(right, statement.rightTime, "PIT JOIN history")
     val timeType = leftTime.dataType
-    require((timeType == DateType || timeType == TimestampType || timeType == TimestampNTZType) &&
-      timeType == rightTime.dataType,
+    require(isTimeType(timeType) && timeType == rightTime.dataType,
       s"PIT JOIN time columns must share a DATE, TIMESTAMP or TIMESTAMP_NTZ type. Found " +
         s"${leftTime.name} (${timeType.simpleString}) and ${rightTime.name} (${rightTime.dataType.simpleString}).")
 
-    val inputNames = leftNames ++ rightNames
-    def internalName(base: String): String =
-      Iterator.iterate(base)(_ + "_").find(name => !inputNames.exists(sameName(name, _))).get
-
-    val sampleId = internalName("__pit_sample_id")
-    val candidateRank = internalName("__pit_rank")
-    val candidateCount = internalName("__pit_best_count")
+    val sampleId = internalName("__pit_sample_id", leftNames ++ rightNames, sameName)
     val sampleAlias = "pit_sample"
     val historyAlias = "pit_history"
     def sample(name: String): Column = qualified(sampleAlias, name)
@@ -49,33 +31,38 @@ private[sparksqlmini] object PointInTimeJoin {
 
     require(statement.keys.nonEmpty, "PIT JOIN requires at least one key pair")
     val keyMatches = statement.keys.map { case (leftKey, rightKey) =>
-      sample(field(leftSchema.fields, leftKey, "sample").name) ===
-        history(field(rightSchema.fields, rightKey, "history").name)
+      sample(field(left, leftKey, "PIT JOIN sample").name) ===
+        history(field(right, rightKey, "PIT JOIN history").name)
     }.reduce(_ && _)
-    val timeMatch = history(rightTime.name) <= sample(leftTime.name)
+    val sampleTime = sample(leftTime.name)
+    val historyTime = history(rightTime.name)
+    val noFuture = historyTime <= sampleTime
+    val timeMatch = statement.lookbackDays.fold(noFuture) { days =>
+      require(days >= 0, "PIT JOIN LOOKBACK must be non-negative")
+      val withinLookback = if (timeType == DateType) {
+        unix_date(sampleTime).cast(LongType) - unix_date(historyTime).cast(LongType) <= lit(days.toLong)
+      } else {
+        val zero = lit(0)
+        val earliest = try_add(sampleTime, make_interval(zero, zero, zero, lit(-days)))
+        // A lower bound earlier than the timestamp range cannot exclude any history.
+        earliest.isNull || historyTime >= earliest
+      }
+      noFuture && withinLookback
+    }
 
     // A sample identifier preserves duplicates when choosing a history row.
     val samples = left.withColumn(sampleId, monotonically_increasing_id()).alias(sampleAlias)
-    val candidates = samples.join(right.alias(historyAlias), keyMatches && timeMatch, "left")
-    val perSample = Window.partitionBy(sample(sampleId))
+    val historySlice = readPartitions(right, statement.partitions, "PIT JOIN").alias(historyAlias)
+    val candidates = samples.join(historySlice, keyMatches && timeMatch, "left")
     val tieOrder = statement.tieBreak.map { name =>
-      history(field(rightSchema.fields, name, "history").name).desc_nulls_last
+      history(field(right, name, "PIT JOIN history").name).desc_nulls_last
     }
-    val latestFirst = perSample.orderBy((Seq(history(rightTime.name).desc_nulls_last) ++ tieOrder): _*)
-
-    // Keep all first-place candidates until we can detect an unresolved tie.
-    // Putting the error in the filter also checks ties when the caller only counts rows.
-    val tieError = "PIT JOIN found multiple latest history rows for a sample. " +
-      "Use TIE BREAK BY with a unique history revision or deduplicate the history."
-    val matched = candidates
-      .withColumn(candidateRank, dense_rank().over(latestFirst))
-      .filter(col(candidateRank) === 1)
-      .withColumn(candidateCount, count(lit(1)).over(perSample))
-      .filter(when(col(candidateCount) > 1, raise_error(lit(tieError)).cast(BooleanType)).otherwise(lit(true)))
+    val matched = latest(candidates, Seq(sample(sampleId)), historyTime.desc_nulls_last +: tieOrder.toVector,
+      "PIT JOIN found multiple latest history rows for a sample.")
 
     matched.select((leftNames.map(sample) ++ rightNames.map(name => history(name).as(s"history_$name"))): _*)
   }
 
   private def qualified(alias: String, name: String): Column =
-    col(s"$alias.`${name.replace("`", "``")}`")
+    col(s"$alias.${quote(name)}")
 }

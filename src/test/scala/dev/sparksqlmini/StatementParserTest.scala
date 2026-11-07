@@ -1,5 +1,6 @@
 package dev.sparksqlmini
 
+import java.time.LocalDate
 import dev.sparksqlmini.Statement._
 import org.junit.jupiter.api.Assertions.{assertEquals, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
@@ -101,17 +102,91 @@ class StatementParserTest {
   }
 
   @Test
+  def parsesSnapshotAssignmentWithTypedCutoffAndHistoryPartitions(): Unit = {
+    val sql = """Daily = SnApShOt catalog . features . history KEY (Tenant, EntityId)
+                 |AS OF timestamp_ntz '2026-11-07 09:30:00.000001' USING event_ts
+                 |TIE BREAK BY revision READ PARTITIONS ingest_dt
+                 |FROM DATE '2026-11-06' TO DATE '2026-11-08';
+                 |SELECT * FROM Daily;""".stripMargin
+    val partitions = PartitionRange("ingest_dt", LocalDate.parse("2026-11-06"), LocalDate.parse("2026-11-08"))
+    assertEquals(
+      Vector(
+        Snapshot("catalog.features.history", Vector("Tenant", "EntityId"),
+          TemporalLiteral("TIMESTAMP_NTZ", "2026-11-07 09:30:00.000001"), "event_ts",
+          Some("revision"), Some("Daily"), Some(partitions)),
+        SparkSql("SELECT * FROM Daily")
+      ),
+      StatementParser.parse(sql)
+    )
+  }
+
+  @Test
+  def parsesStandaloneSnapshotAndKeepsNativeSql(): Unit = {
+    val sql = "SNAPSHOT history KEY (id) AS OF DATE '2026-11-07' USING event_dt"
+    assertEquals(
+      Vector(
+        Snapshot("history", Vector("id"), TemporalLiteral("DATE", "2026-11-07"), "event_dt", None, None),
+        SparkSql("SELECT snapshot FROM history")
+      ),
+      StatementParser.parse(s"$sql; SELECT snapshot FROM history;")
+    )
+  }
+
+  @Test
+  def rejectsMalformedSnapshotSyntax(): Unit = {
+    Vector(
+      "SNAPSHOT history KEY () AS OF DATE '2026-11-07' USING event_dt",
+      "SNAPSHOT history KEY (id,) AS OF DATE '2026-11-07' USING event_dt",
+      "SNAPSHOT history KEY (id) AS OF '2026-11-07' USING event_dt",
+      "SNAPSHOT history KEY (id) AS OF DATE '2026-11-07' USING event_dt READ PARTITIONS ingest_dt"
+    ).foreach { sql =>
+      val error = assertThrows(classOf[IllegalArgumentException], () => StatementParser.parse(sql))
+      assertTrue(error.getMessage.contains("SNAPSHOT"))
+    }
+  }
+
+  @Test
+  def parsesPitJoinLookbackAndHistoryPartitionRange(): Unit = {
+    val sql = """PIT JOIN samples WITH history ON (id = entity_id) AS OF sample_dt USING event_dt
+                 |LOOKBACK 0 DAYS TIE BREAK BY revision READ PARTITIONS ingest_dt
+                 |FROM DATE '2026-11-07' TO DATE '2026-11-07'""".stripMargin
+    val day = LocalDate.parse("2026-11-07")
+    assertEquals(
+      Vector(PitJoin("samples", "history", Vector("id" -> "entity_id"), "sample_dt", "event_dt",
+        Some("revision"), None, Some(0), Some(PartitionRange("ingest_dt", day, day)))),
+      StatementParser.parse(sql)
+    )
+  }
+
+  @Test
+  def rejectsInvalidHistoryPartitionRanges(): Unit = {
+    val sql = "SNAPSHOT history KEY (id) AS OF DATE '2026-11-07' USING event_dt READ PARTITIONS ingest_dt"
+    Vector(
+      "FROM DATE '2026-02-29' TO DATE '2026-11-08'",
+      "FROM DATE '2026-11-08' TO DATE '2026-11-07'"
+    ).foreach { range =>
+      val error = assertThrows(classOf[IllegalArgumentException], () => StatementParser.parse(s"$sql $range"))
+      assertTrue(error.getMessage.contains("READ PARTITIONS"))
+    }
+  }
+
+  @Test
   def reportsMalformedPitJoinSyntax(): Unit = {
     Vector(
       "PIT JOIN samples WITH history ON () AS OF sample_ts USING feature_ts",
       "asof = PIT JOIN samples WITH history ON (id = entity_id,) AS OF sample_ts USING feature_ts",
       "PIT JOIN samples WITH history ON (id = history.entity_id) AS OF sample_ts USING feature_ts",
       "PIT JOIN samples WITH history ON (id = entity_id) AS OF sample_ts",
-      "PIT JOIN samples WITH history ON (id = entity_id) AS OF sample_ts USING feature_ts TIE BREAK BY r, id"
+      "PIT JOIN samples WITH history ON (id = entity_id) AS OF sample_ts USING feature_ts TIE BREAK BY r, id",
+      "PIT JOIN samples WITH history ON (id = entity_id) AS OF sample_ts USING feature_ts LOOKBACK -1 DAYS"
     ).foreach { sql =>
       val error = assertThrows(classOf[IllegalArgumentException], () => StatementParser.parse(sql))
       assertTrue(error.getMessage.contains("Invalid PIT JOIN syntax"))
     }
+    val tooLarge = "PIT JOIN samples WITH history ON (id = entity_id) AS OF sample_ts USING feature_ts " +
+      "LOOKBACK 2147483648 DAYS"
+    val error = assertThrows(classOf[IllegalArgumentException], () => StatementParser.parse(tooLarge))
+    assertTrue(error.getMessage.contains("PIT JOIN LOOKBACK"))
   }
 
   @Test

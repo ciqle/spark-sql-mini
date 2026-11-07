@@ -1,5 +1,7 @@
 package dev.sparksqlmini
 
+import java.time.LocalDate
+
 /** Operations recognized by the wrapper, plus native Spark SQL. */
 sealed trait Statement
 
@@ -7,6 +9,17 @@ object Statement {
   final case class AssignTemp(name: String, query: String) extends Statement
   final case class InsertTemp(source: String, target: String) extends Statement
   final case class InsertPartition(source: String, target: String, spec: String) extends Statement
+  final case class TemporalLiteral(kind: String, value: String)
+  final case class PartitionRange(column: String, from: LocalDate, to: LocalDate)
+  final case class Snapshot(
+      source: String,
+      keys: Vector[String],
+      asOf: TemporalLiteral,
+      timeColumn: String,
+      tieBreak: Option[String],
+      view: Option[String],
+      partitions: Option[PartitionRange] = None
+  ) extends Statement
   final case class PitJoin(
       left: String,
       right: String,
@@ -14,7 +27,9 @@ object Statement {
       leftTime: String,
       rightTime: String,
       tieBreak: Option[String],
-      view: Option[String]
+      view: Option[String],
+      lookbackDays: Option[Int] = None,
+      partitions: Option[PartitionRange] = None
   ) extends Statement
   final case class Score(
       source: String,

@@ -47,6 +47,11 @@ object Main {
               case Some(name) => println(s"Registered point-in-time joined temp view: $name")
               case None => result.show(truncate = false)
             }
+          case snapshot: Snapshot =>
+            snapshot.view match {
+              case Some(name) => println(s"Registered snapshot temp view: $name")
+              case None => result.show(truncate = false)
+            }
           case SparkSql(sql) if sql.matches("(?is)^explain\\b.*") =>
             // EXPLAIN is one text column; printing it directly keeps the plan readable.
             result.collect().foreach(row => println(row.getString(0)))

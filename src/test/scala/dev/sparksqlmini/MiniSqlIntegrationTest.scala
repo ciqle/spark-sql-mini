@@ -3,7 +3,7 @@ package dev.sparksqlmini
 import java.nio.file.{Files, Path, Paths}
 import scala.jdk.CollectionConverters._
 import scala.util.Using
-import org.apache.spark.sql.{AnalysisException, Row, SparkSession}
+import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.types.{LongType, StructField, StructType}
 import org.junit.jupiter.api.{AfterAll, BeforeAll, Test, TestInstance}
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertThrows, assertTrue}
@@ -251,5 +251,157 @@ class MiniSqlIntegrationTest {
     assertTrue(Iterator.iterate[Throwable](error)(_.getCause).takeWhile(_ != null)
       .exists(e => Option(e.getMessage).exists(message =>
         message.contains("PIT JOIN") && message.toLowerCase(java.util.Locale.ROOT).contains("tie"))))
+  }
+
+  @Test
+  def snapshotsAtTheCutoffAndReadsOnlyTheRequestedHistoryPartitions(): Unit = {
+    val snapshot = engine.run("""
+      CREATE TABLE snapshot_events (id INT, region STRING, event_dt DATE, revision INT, label STRING, ingest_dt DATE)
+        USING PARQUET PARTITIONED BY (ingest_dt);
+      INSERT INTO snapshot_events VALUES
+        (10, 'sg', DATE '2026-11-06', 1, 'old', DATE '2026-11-06'),
+        (10, 'sg', DATE '2026-11-07', 1, 'rev1', DATE '2026-11-08'),
+        (10, 'sg', DATE '2026-11-07', 2, 'rev2', DATE '2026-11-08'),
+        (10, 'sg', DATE '2026-11-07', 9, 'before read range', DATE '2026-11-05'),
+        (10, 'sg', DATE '2026-11-07', 10, 'after read range', DATE '2026-11-09'),
+        (10, 'sg', DATE '2026-11-08', 99, 'future', DATE '2026-11-08'),
+        (10, 'us', DATE '2026-11-06', 1, 'other region', DATE '2026-11-06'),
+        (20, 'sg', DATE '2026-11-08', 1, 'future only', DATE '2026-11-08'),
+        (30, 'sg', NULL, 1, 'unknown time', DATE '2026-11-08'),
+        (40, NULL, DATE '2026-11-07', 1, 'unknown region', DATE '2026-11-08');
+      daily_state = SNAPSHOT snapshot_events KEY (id, region) AS OF DATE '2026-11-07' USING event_dt
+        TIE BREAK BY revision READ PARTITIONS ingest_dt FROM DATE '2026-11-06' TO DATE '2026-11-08';
+      SELECT id, region, label, CAST(ingest_dt AS STRING) FROM daily_state ORDER BY id, region;
+    """).last
+
+    assertEquals(Vector("id", "region", "event_dt", "revision", "label", "ingest_dt"),
+      spark.table("daily_state").columns.toVector)
+    assertEquals(Vector(Row(10, "sg", "rev2", "2026-11-08"), Row(10, "us", "other region", "2026-11-06")),
+      snapshot.collect().toVector)
+    assertHistoryPartitionFilters(snapshot)
+  }
+
+  @Test
+  def snapshotsRespectTimestampPrecisionAndRequireMatchingTimeTypes(): Unit = {
+    engine.run("""
+      timed_events = SELECT * FROM VALUES
+        (10, TIMESTAMP_NTZ '2026-11-07 10:00:00.000001', 'at cutoff'),
+        (10, TIMESTAMP_NTZ '2026-11-07 10:00:00.000002', 'after cutoff')
+      AS history(id, event_ts, label);
+    """)
+    val prefix = "SNAPSHOT timed_events KEY (id) AS OF "
+    val snapshot = engine.run(s"${prefix}TIMESTAMP_NTZ '2026-11-07 10:00:00.000001' USING event_ts;").last
+    assertEquals(Vector(Row(10, "at cutoff")), snapshot.select("id", "label").collect().toVector)
+
+    assertThrows(classOf[IllegalArgumentException], () =>
+      engine.run(s"${prefix}DATE '2026-11-07' USING event_ts;"))
+
+    assertThrows(classOf[IllegalArgumentException], () =>
+      engine.run(s"""${prefix}TIMESTAMP_NTZ '2026-11-07 10:00:00.000001' USING event_ts
+        READ PARTITIONS label FROM DATE '2026-11-06' TO DATE '2026-11-08';"""))
+  }
+
+  @Test
+  def reportsAnUnresolvedSnapshotTieEvenWhenCountingRows(): Unit = {
+    val snapshot = engine.run("""
+      tied_events = SELECT * FROM VALUES
+        (10, DATE '2026-11-07', 2, 'first'),
+        (10, DATE '2026-11-07', 2, 'second') AS history(id, event_dt, revision, label);
+      SNAPSHOT tied_events KEY (id) AS OF DATE '2026-11-07' USING event_dt TIE BREAK BY revision;
+    """).last
+    val error = assertThrows(classOf[RuntimeException], () => snapshot.count())
+    assertTrue(Iterator.iterate[Throwable](error)(_.getCause).takeWhile(_ != null)
+      .exists(e => Option(e.getMessage).exists(message =>
+        message.contains("SNAPSHOT") && message.toLowerCase(java.util.Locale.ROOT).contains("tie"))))
+  }
+
+  @Test
+  def restrictsPitHistoryBySampleLookbackAndPartitionRangeIndependently(): Unit = {
+    engine.run("""
+      CREATE TABLE bounded_history (id INT, event_dt DATE, label STRING, ingest_dt DATE)
+        USING PARQUET PARTITIONED BY (ingest_dt);
+      INSERT INTO bounded_history VALUES
+        (10, DATE '2026-11-06', 'lookback boundary', DATE '2026-11-08'),
+        (10, DATE '2026-11-07', 'outside partition range', DATE '2026-11-09'),
+        (10, DATE '2026-11-08', 'after sample', DATE '2026-11-08'),
+        (20, DATE '2026-11-06', 'before lookback', DATE '2026-11-06'),
+        (30, DATE '2026-11-07', 'exact', DATE '2026-11-06');
+      bounded_samples = SELECT * FROM VALUES
+        (1, 10, DATE '2026-11-07'),
+        (1, 10, DATE '2026-11-07'),
+        (2, 20, DATE '2026-11-08'),
+        (3, 30, DATE '2026-11-07') AS samples(sample_id, id, sample_dt);
+    """)
+    val join = """
+      PIT JOIN bounded_samples WITH bounded_history ON (id = id) AS OF sample_dt USING event_dt
+        LOOKBACK %d DAYS READ PARTITIONS ingest_dt FROM DATE '2026-11-06' TO DATE '2026-11-08';
+    """
+    val joined = engine.run(join.format(1)).last.select("sample_id", "history_label").orderBy("sample_id")
+    assertEquals(Vector(Row(1, "lookback boundary"), Row(1, "lookback boundary"), Row(2, null), Row(3, "exact")),
+      joined.collect().toVector)
+    assertHistoryPartitionFilters(joined)
+
+    val exact = engine.run(join.format(0)).last.select("sample_id", "history_label").orderBy("sample_id")
+    assertEquals(Vector(Row(1, null), Row(1, null), Row(2, null), Row(3, "exact")), exact.collect().toVector)
+  }
+
+  @Test
+  def handlesPreciseTimestampAndLargeLookbackBoundsWithoutOverflow(): Unit = {
+    engine.run("""
+      timed_samples = SELECT * FROM VALUES
+        (10, TIMESTAMP_NTZ '1969-12-29 10:00:00.000001'),
+        (20, TIMESTAMP_NTZ '1969-12-29 10:00:00.000001') AS samples(id, sample_time);
+      timed_history = SELECT * FROM VALUES
+        (10, TIMESTAMP_NTZ '1969-12-28 10:00:00.000001', 'boundary'),
+        (20, TIMESTAMP_NTZ '1969-12-28 10:00:00.000000', 'earlier'),
+        (20, TIMESTAMP_NTZ '1969-12-30 10:00:00.000000', 'future')
+        AS history(id, event_time, label);
+      dated_samples = SELECT id, CAST(sample_time AS DATE) AS sample_time FROM timed_samples;
+      dated_history = SELECT id, CAST(event_time AS DATE) AS event_time, label FROM timed_history;
+    """)
+    def joined(prefix: String, days: Int): Vector[Row] =
+      engine.run(s"""
+        PIT JOIN ${prefix}_samples WITH ${prefix}_history ON (id = id) AS OF sample_time USING event_time
+          LOOKBACK $days DAYS;
+      """).last.select("id", "history_label").orderBy("id").collect().toVector
+
+    assertEquals(Vector(Row(10, "boundary"), Row(20, null)), joined("timed", 1))
+    val allPast = Vector(Row(10, "boundary"), Row(20, "earlier"))
+    assertEquals(allPast, joined("timed", Int.MaxValue))
+    assertEquals(allPast, joined("dated", Int.MaxValue))
+  }
+
+  @Test
+  def usesTheSessionTimeZoneForTimestampCutoffsAndCalendarDayLookback(): Unit = {
+    val regionalSpark = spark.newSession()
+    regionalSpark.conf.set("spark.sql.session.timeZone", "America/Los_Angeles")
+    val regionalEngine = new MiniSql(regionalSpark)
+    val results = regionalEngine.run("""
+      zoned_history = SELECT * FROM VALUES
+        (10, TIMESTAMP_LTZ '2026-03-08 00:30:00-08:00', 'at cutoff'),
+        (20, TIMESTAMP_LTZ '2026-03-08 00:00:00-08:00', 'before lookback'),
+        (30, TIMESTAMP_LTZ '2026-03-08 00:31:00-08:00', 'after cutoff')
+      AS history(id, event_time, label);
+      zoned_samples = SELECT * FROM VALUES
+        (10, TIMESTAMP_LTZ '2026-03-09 00:30:00-07:00'),
+        (20, TIMESTAMP_LTZ '2026-03-09 00:30:00-07:00') AS samples(id, sample_time);
+      zoned_state = SNAPSHOT zoned_history KEY (id)
+        AS OF TIMESTAMP_LTZ '2026-03-08 00:30:00' USING event_time;
+      SELECT id, label FROM zoned_state ORDER BY id;
+      zoned_join = PIT JOIN zoned_samples WITH zoned_history ON (id = id)
+        AS OF sample_time USING event_time LOOKBACK 1 DAYS;
+      SELECT id, history_label FROM zoned_join ORDER BY id;
+    """)
+    assertEquals(Vector(Row(10, "at cutoff"), Row(20, "before lookback")), results(3).collect().toVector)
+    assertEquals(Vector(Row(10, "at cutoff"), Row(20, null)), results.last.collect().toVector)
+  }
+
+  private def assertHistoryPartitionFilters(data: DataFrame): Unit = {
+    val plan = data.queryExecution.executedPlan.toString
+    val filters = plan.linesIterator
+      .find(_.contains("PartitionFilters: ["))
+      .map(_.split("PartitionFilters: \\[", 2)(1).takeWhile(_ != ']'))
+      .getOrElse("")
+    assertTrue(filters.contains("ingest_dt") && filters.contains("2026-11-06") && filters.contains("2026-11-08"), plan)
   }
 }

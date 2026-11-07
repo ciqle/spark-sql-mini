@@ -1,5 +1,7 @@
 package dev.sparksqlmini
 
+import java.time.LocalDate
+import java.time.format.DateTimeParseException
 import java.util.Locale
 
 import dev.sparksqlmini.Statement._
@@ -8,7 +10,7 @@ import dev.sparksqlmini.Statement._
 object StatementParser {
   private val identifier = "[A-Za-z_][A-Za-z0-9_]*"
   private val qualifiedIdentifier = identifier + "(?:\\s*\\.\\s*" + identifier + ")*"
-  private val featureList = identifier + "(?:\\s*,\\s*" + identifier + ")*"
+  private val columnList = identifier + "(?:\\s*,\\s*" + identifier + ")*"
   private val keyPair = identifier + "\\s*=\\s*" + identifier
   private val joinKeyList = keyPair + "(?:\\s*,\\s*" + keyPair + ")*"
   private val assignment = ("(?is)^(" + identifier + ")\\s*=\\s*(.*)$").r
@@ -17,19 +19,35 @@ object StatementParser {
   private val insertion = (insertTarget + "$").r
   private val partitionInsertion = (insertTarget + "\\s+partition\\s*\\((.*)\\)$").r
   private val wrapperInsertStart = ("(?is)^insert\\s+" + identifier + "\\s+into\\s+table\\b.*$").r
+  private val isoDate = "[0-9]{4}-[0-9]{2}-[0-9]{2}"
+  private val dateLiteral = "date\\s+'(" + isoDate + ")'"
+  private val temporalLiteral = """(date|timestamp(?:_ltz|_ntz)?)\s+'([^'\\\r\n]+)'"""
+  private val tieBreakClause = "(?:\\s+tie\\s+break\\s+by\\s+(" + identifier + "))?"
+  private val partitionRangeClause =
+    "(?:\\s+read\\s+partitions\\s+(" + identifier + ")\\s+from\\s+" + dateLiteral +
+      "\\s+to\\s+" + dateLiteral + ")?"
+  private val partitionRangeSyntax =
+    " [READ PARTITIONS <date column> FROM DATE 'YYYY-MM-DD' TO DATE 'YYYY-MM-DD']"
+  private val snapshot = (
+    "(?is)^snapshot\\s+(" + qualifiedIdentifier + ")\\s+key\\s*\\(\\s*(" + columnList + ")\\s*\\)" +
+      "\\s+as\\s+of\\s+" + temporalLiteral +
+      "\\s+using\\s+(" + identifier + ")" + tieBreakClause + partitionRangeClause + "$"
+  ).r
   private val pitJoin = (
     "(?is)^pit\\s+join\\s+(" + qualifiedIdentifier + ")\\s+with\\s+(" + qualifiedIdentifier + ")" +
       "\\s+on\\s*\\(\\s*(" + joinKeyList + ")\\s*\\)\\s+as\\s+of\\s+(" + identifier + ")" +
-      "\\s+using\\s+(" + identifier + ")(?:\\s+tie\\s+break\\s+by\\s+(" + identifier + "))?$"
+      "\\s+using\\s+(" + identifier + ")(?:\\s+lookback\\s+([0-9]+)\\s+days)?" +
+      tieBreakClause + partitionRangeClause + "$"
   ).r
   private val scoring = (
     "(?is)^score\\s+(" + qualifiedIdentifier + ")\\s+using\\s+(" + identifier + ")" +
-      "\\s+'([^']*(?:''[^']*)*)'\\s+features\\s*\\(\\s*(" + featureList + ")\\s*\\)" +
+      "\\s+'([^']*(?:''[^']*)*)'\\s+features\\s*\\(\\s*(" + columnList + ")\\s*\\)" +
       "\\s+as\\s+(" + identifier + ")$"
   ).r
   private val queryStart = "(?is)^select\\b.*$".r
   private val scoreStart = "(?is)^score\\b.*$".r
   private val pitJoinStart = "(?is)^pit\\s+join\\b.*$".r
+  private val snapshotStart = "(?is)^snapshot\\b.*$".r
 
   def parse(script: String): Vector[Statement] = {
     require(script != null, "SQL script must not be null")
@@ -38,10 +56,12 @@ object StatementParser {
         parseScore(expression, Some(name))
       case assignment(name, expression) if pitJoinStart.matches(expression) =>
         parsePitJoin(expression, Some(name))
+      case assignment(name, expression) if snapshotStart.matches(expression) =>
+        parseSnapshot(expression, Some(name))
       case assignment(name, query) =>
         require(
           queryStart.matches(query),
-          s"Assignment '$name' must contain a SELECT query, SCORE statement, or PIT JOIN statement"
+          s"Assignment '$name' must contain a SELECT query, SCORE, PIT JOIN, or SNAPSHOT statement"
         )
         AssignTemp(name, query)
       case partitionInsertion(source, target, spec) =>
@@ -58,16 +78,23 @@ object StatementParser {
         parseScore(sql, None)
       case sql if pitJoinStart.matches(sql) =>
         parsePitJoin(sql, None)
+      case sql if snapshotStart.matches(sql) =>
+        parseSnapshot(sql, None)
       case sql => SparkSql(sql)
     }
   }
 
   private def parsePitJoin(sql: String, view: Option[String]): PitJoin = sql match {
-    case pitJoin(left, right, keys, leftTime, rightTime, tieBreak) =>
+    case pitJoin(left, right, keys, leftTime, rightTime, lookback, tieBreak, partitionColumn, from, to) =>
       val keyPairs = keys.split(",").iterator.map { pair =>
         val columns = pair.split("=", 2)
         (columns(0).trim, columns(1).trim)
       }.toVector
+      val lookbackDays = Option(lookback).map { value =>
+        value.toIntOption.getOrElse(throw new IllegalArgumentException(
+          "PIT JOIN LOOKBACK must be a non-negative 32-bit integer"
+        ))
+      }
       PitJoin(
         normalizeQualifiedName(left),
         normalizeQualifiedName(right),
@@ -75,13 +102,53 @@ object StatementParser {
         leftTime,
         rightTime,
         Option(tieBreak),
-        view
+        view,
+        lookbackDays,
+        parsePartitionRange(partitionColumn, from, to)
       )
     case _ =>
       throw new IllegalArgumentException(
         "Invalid PIT JOIN syntax. Expected PIT JOIN <left> WITH <right> ON (<left key> = <right key>, ...) " +
-          "AS OF <left time> USING <right time> [TIE BREAK BY <right column>]"
+          "AS OF <left time> USING <right time> [LOOKBACK <days> DAYS] [TIE BREAK BY <right column>]" +
+          partitionRangeSyntax
       )
+  }
+
+  private def parseSnapshot(sql: String, view: Option[String]): Snapshot = sql match {
+    case snapshot(source, keys, literalKind, value, timeColumn, tieBreak, partitionColumn, from, to) =>
+      val kind = literalKind.toUpperCase(Locale.ROOT)
+      val asOf = TemporalLiteral(kind, if (kind == "DATE") parseDate(value, "SNAPSHOT AS OF").toString else value)
+      Snapshot(
+        normalizeQualifiedName(source),
+        keys.split(",").iterator.map(_.trim).toVector,
+        asOf,
+        timeColumn,
+        Option(tieBreak),
+        view,
+        parsePartitionRange(partitionColumn, from, to)
+      )
+    case _ =>
+      throw new IllegalArgumentException(
+        "Invalid SNAPSHOT syntax. Expected SNAPSHOT <source> KEY (<column>, ...) AS OF <date or timestamp literal> " +
+          "USING <time column> [TIE BREAK BY <column>]" + partitionRangeSyntax
+      )
+  }
+
+  private def parsePartitionRange(column: String, from: String, to: String): Option[PartitionRange] =
+    Option(column).map { name =>
+      val start = parseDate(from, "READ PARTITIONS FROM")
+      val end = parseDate(to, "READ PARTITIONS TO")
+      require(!start.isAfter(end), "READ PARTITIONS FROM date must be on or before TO date")
+      PartitionRange(name, start, end)
+    }
+
+  private def parseDate(value: String, clause: String): LocalDate = {
+    val message = s"Invalid $clause date '$value'. Expected a valid date in YYYY-MM-DD format"
+    require(value.matches(isoDate), message)
+    try LocalDate.parse(value)
+    catch {
+      case e: DateTimeParseException => throw new IllegalArgumentException(message, e)
+    }
   }
 
   private def parseScore(sql: String, view: Option[String]): Score = sql match {
