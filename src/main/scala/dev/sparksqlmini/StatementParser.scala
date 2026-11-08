@@ -9,13 +9,15 @@ import dev.sparksqlmini.Statement._
 /** Recognizes the outer wrapper syntax; Spark remains responsible for SQL parsing. */
 object StatementParser {
   private val identifier = "[A-Za-z_][A-Za-z0-9_]*"
-  private val qualifiedIdentifier = identifier + "(?:\\s*\\.\\s*" + identifier + ")*"
-  private val columnList = identifier + "(?:\\s*,\\s*" + identifier + ")*"
+  private val qualifiedIdentifier = identifier + "(?:\\s*\\.\\s*" + identifier + ")*+"
+  private val columnList = identifier + "(?:\\s*,\\s*" + identifier + ")*+"
   private val keyPair = identifier + "\\s*=\\s*" + identifier
-  private val joinKeyList = keyPair + "(?:\\s*,\\s*" + keyPair + ")*"
+  private val joinKeyList = keyPair + "(?:\\s*,\\s*" + keyPair + ")*+"
   private val assignment = ("(?is)^(" + identifier + ")\\s*=\\s*(.*)$").r
   private val let = ("(?is)^let\\s+(" + identifier + ")\\s*=\\s*(.*)$").r
-  private val include = """(?is)^include\s+'((?:[^'\\\r\n]|'')+)'$""".r
+  // Each token in these lists and quoted paths has a distinct delimiter. Commit to it
+  // once matched so long inputs don't grow the regex engine's backtracking stack.
+  private val include = """(?is)^include\s+'((?:[^'\\\r\n]|'')++)'$""".r
   private val insertTarget =
     "(?is)^insert\\s+(" + identifier + ")\\s+into\\s+table\\s+(" + qualifiedIdentifier + ")"
   private val insertion = (insertTarget + "$").r
@@ -43,7 +45,7 @@ object StatementParser {
   ).r
   private val scoring = (
     "(?is)^score\\s+(" + qualifiedIdentifier + ")\\s+using\\s+(" + identifier + ")" +
-      "\\s+'([^']*(?:''[^']*)*)'\\s+features\\s*\\(\\s*(" + columnList + ")\\s*\\)" +
+      "\\s+'([^']*+(?:''[^']*+)*+)'\\s+features\\s*\\(\\s*(" + columnList + ")\\s*\\)" +
       "\\s+as\\s+(" + identifier + ")$"
   ).r
   private val queryStart = "(?is)^select\\b.*$".r
@@ -56,44 +58,52 @@ object StatementParser {
 
   def parse(script: String): Vector[Statement] = {
     require(script != null, "SQL script must not be null")
-    splitStatements(script).map {
-      case assignment(name, expression) if scoreStart.matches(expression) =>
-        parseScore(expression, Some(name))
-      case assignment(name, expression) if pitJoinStart.matches(expression) =>
-        parsePitJoin(expression, Some(name))
-      case assignment(name, expression) if snapshotStart.matches(expression) =>
-        parseSnapshot(expression, Some(name))
-      case assignment(name, query) =>
-        require(
-          queryStart.matches(query),
-          s"Assignment '$name' must contain a SELECT query, SCORE, PIT JOIN, or SNAPSHOT statement"
-        )
-        AssignTemp(name, query)
-      case let(name, query) if scalarQueryStart.matches(query) =>
-        Let(name, query)
-      case sql if letStart.matches(sql) =>
-        throw new IllegalArgumentException("Invalid LET syntax. Expected LET <name> = <SELECT or WITH query>")
-      case include(path) => Include(path.replace("''", "'"))
-      case sql if includeStart.matches(sql) =>
-        throw new IllegalArgumentException("Invalid INCLUDE syntax. Expected INCLUDE '<relative path>'")
-      case partitionInsertion(source, target, spec) =>
-        val partitionSpec = spec.trim
-        require(partitionSpec.nonEmpty, "INSERT PARTITION specification must not be empty")
-        InsertPartition(source, normalizeQualifiedName(target), partitionSpec)
-      case insertion(source, target) =>
-        InsertTemp(source, normalizeQualifiedName(target))
-      case sql if wrapperInsertStart.matches(sql) =>
-        throw new IllegalArgumentException(
-          "Invalid INSERT syntax. Expected INSERT <source> INTO TABLE <target> [PARTITION (<specification>)]"
-        )
-      case sql if scoreStart.matches(sql) =>
-        parseScore(sql, None)
-      case sql if pitJoinStart.matches(sql) =>
-        parsePitJoin(sql, None)
-      case sql if snapshotStart.matches(sql) =>
-        parseSnapshot(sql, None)
-      case sql => SparkSql(sql)
-    }
+    splitStatements(script).iterator.zipWithIndex.map { case (sql, index) =>
+      try parseStatement(sql)
+      catch {
+        case error: IllegalArgumentException =>
+          throw new IllegalArgumentException(s"Statement ${index + 1}: ${error.getMessage}", error)
+      }
+    }.toVector
+  }
+
+  private def parseStatement(text: String): Statement = text match {
+    case assignment(name, expression) if scoreStart.matches(expression) =>
+      parseScore(expression, Some(name))
+    case assignment(name, expression) if pitJoinStart.matches(expression) =>
+      parsePitJoin(expression, Some(name))
+    case assignment(name, expression) if snapshotStart.matches(expression) =>
+      parseSnapshot(expression, Some(name))
+    case assignment(name, query) =>
+      require(
+        queryStart.matches(query),
+        s"Assignment '$name' must contain a SELECT query, SCORE, PIT JOIN, or SNAPSHOT statement"
+      )
+      AssignTemp(name, query)
+    case let(name, query) if scalarQueryStart.matches(query) =>
+      Let(name, query)
+    case sql if letStart.matches(sql) =>
+      throw new IllegalArgumentException("Invalid LET syntax. Expected LET <name> = <SELECT or WITH query>")
+    case include(path) => Include(path.replace("''", "'"))
+    case sql if includeStart.matches(sql) =>
+      throw new IllegalArgumentException("Invalid INCLUDE syntax. Expected INCLUDE '<relative path>'")
+    case partitionInsertion(source, target, spec) =>
+      val partitionSpec = spec.trim
+      require(partitionSpec.nonEmpty, "INSERT PARTITION specification must not be empty")
+      InsertPartition(source, normalizeQualifiedName(target), partitionSpec)
+    case insertion(source, target) =>
+      InsertTemp(source, normalizeQualifiedName(target))
+    case sql if wrapperInsertStart.matches(sql) =>
+      throw new IllegalArgumentException(
+        "Invalid INSERT syntax. Expected INSERT <source> INTO TABLE <target> [PARTITION (<specification>)]"
+      )
+    case sql if scoreStart.matches(sql) =>
+      parseScore(sql, None)
+    case sql if pitJoinStart.matches(sql) =>
+      parsePitJoin(sql, None)
+    case sql if snapshotStart.matches(sql) =>
+      parseSnapshot(sql, None)
+    case sql => SparkSql(sql)
   }
 
   private def parsePitJoin(sql: String, view: Option[String]): PitJoin = sql match {

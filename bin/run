@@ -6,7 +6,10 @@ if [[ $# -lt 1 ]]; then
   exit 2
 fi
 # Resolve the script before changing directory, so paths work from any directory.
-script_file="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+script_file="$1"
+if [[ "$script_file" != /* ]]; then
+  script_file="$PWD/$script_file"
+fi
 shift
 source "$project_dir/bin/java-env.sh"
 cd "$project_dir"

@@ -25,14 +25,14 @@ final class MiniSql(val spark: SparkSession) {
   def runFile(path: Path, parameters: Map[String, Any] = Map.empty): Vector[DataFrame] = {
     val entries = ScriptLoader.load(path)
     val execution = new Execution(parameters)
-    entries.map(entry => execution.execute(entry))
+    entries.map(entry => execution.execute(entry)(identity))
   }
 
   private[sparksqlmini] final class Execution(initialParameters: Map[String, Any]) {
     private var parameters = initialParameters
 
-    def execute(entry: ScriptLoader.Entry): DataFrame = {
-      try execute(entry.statement)
+    def execute[A](entry: ScriptLoader.Entry)(consume: DataFrame => A): A = {
+      try consume(execute(entry.statement))
       catch {
         case NonFatal(error) =>
           throw new RuntimeException(s"${entry.file} (statement ${entry.number}): ${error.getMessage}", error)

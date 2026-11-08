@@ -7,6 +7,25 @@ import org.junit.jupiter.api.Test
 
 class StatementParserTest {
   @Test
+  def parsesLongQuotedPathsAndColumnListsWithoutBacktracking(): Unit = {
+    val includePath = "directory/" + "x" * 16000 + ".sql"
+    val modelPath = "owner's-" * 4000 + "model.onnx"
+    val features = (1 to 2048).map(index => s"feature_$index").toVector
+    val encodedPath = modelPath.replace("'", "''")
+    val script = s"INCLUDE '$includePath'; SCORE inputs USING ONNX '$encodedPath' FEATURES (${features.mkString(",")}) AS result;"
+
+    assertEquals(Vector(Include(includePath), Score("inputs", "onnx", modelPath, features, "result", None)),
+      StatementParser.parse(script))
+  }
+
+  @Test
+  def identifiesTheMalformedWrapperStatement(): Unit = {
+    val error = assertThrows(classOf[IllegalArgumentException], () =>
+      StatementParser.parse("SELECT 1; SCORE broken;"))
+    assertTrue(error.getMessage.startsWith("Statement 2: Invalid SCORE syntax"))
+  }
+
+  @Test
   def recognizesOnlyTheWrapperAndPassesOtherSqlThrough(): Unit = {
     val sql = "CREATE TABLE output (id BIGINT) USING parquet"
     assertEquals(

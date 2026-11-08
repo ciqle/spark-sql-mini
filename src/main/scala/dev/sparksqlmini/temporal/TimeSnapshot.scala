@@ -16,7 +16,9 @@ private[sparksqlmini] object TimeSnapshot {
     val literal = statement.asOf
     require(Set("DATE", "TIMESTAMP", "TIMESTAMP_LTZ", "TIMESTAMP_NTZ").contains(literal.kind),
       "SNAPSHOT AS OF requires a DATE or TIMESTAMP literal")
-    require(literal.value.nonEmpty && !literal.value.exists(c => c == '\'' || c == '\\'),
+    // Spark expands ${...} before parsing SQL, including inside quoted literals.
+    require(literal.value.nonEmpty && !literal.value.contains("${") &&
+      !literal.value.exists(c => c == '\'' || c == '\\'),
       "SNAPSHOT AS OF requires a valid date or timestamp value")
     // Let Spark parse the typed literal, including timestamp offsets and the session time zone.
     val cutoff = expr(s"${literal.kind} '${literal.value}'")
