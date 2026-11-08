@@ -14,6 +14,8 @@ object StatementParser {
   private val keyPair = identifier + "\\s*=\\s*" + identifier
   private val joinKeyList = keyPair + "(?:\\s*,\\s*" + keyPair + ")*"
   private val assignment = ("(?is)^(" + identifier + ")\\s*=\\s*(.*)$").r
+  private val let = ("(?is)^let\\s+(" + identifier + ")\\s*=\\s*(.*)$").r
+  private val include = """(?is)^include\s+'((?:[^'\\\r\n]|'')+)'$""".r
   private val insertTarget =
     "(?is)^insert\\s+(" + identifier + ")\\s+into\\s+table\\s+(" + qualifiedIdentifier + ")"
   private val insertion = (insertTarget + "$").r
@@ -45,6 +47,9 @@ object StatementParser {
       "\\s+as\\s+(" + identifier + ")$"
   ).r
   private val queryStart = "(?is)^select\\b.*$".r
+  private val scalarQueryStart = "(?is)^(?:select|with)\\b.*$".r
+  private val letStart = "(?is)^let\\b.*$".r
+  private val includeStart = "(?is)^include\\b.*$".r
   private val scoreStart = "(?is)^score\\b.*$".r
   private val pitJoinStart = "(?is)^pit\\s+join\\b.*$".r
   private val snapshotStart = "(?is)^snapshot\\b.*$".r
@@ -64,6 +69,13 @@ object StatementParser {
           s"Assignment '$name' must contain a SELECT query, SCORE, PIT JOIN, or SNAPSHOT statement"
         )
         AssignTemp(name, query)
+      case let(name, query) if scalarQueryStart.matches(query) =>
+        Let(name, query)
+      case sql if letStart.matches(sql) =>
+        throw new IllegalArgumentException("Invalid LET syntax. Expected LET <name> = <SELECT or WITH query>")
+      case include(path) => Include(path.replace("''", "'"))
+      case sql if includeStart.matches(sql) =>
+        throw new IllegalArgumentException("Invalid INCLUDE syntax. Expected INCLUDE '<relative path>'")
       case partitionInsertion(source, target, spec) =>
         val partitionSpec = spec.trim
         require(partitionSpec.nonEmpty, "INSERT PARTITION specification must not be empty")

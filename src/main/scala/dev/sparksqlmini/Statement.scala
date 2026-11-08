@@ -7,6 +7,8 @@ sealed trait Statement
 
 object Statement {
   final case class AssignTemp(name: String, query: String) extends Statement
+  final case class Let(name: String, query: String) extends Statement
+  final case class Include(path: String) extends Statement
   final case class InsertTemp(source: String, target: String) extends Statement
   final case class InsertPartition(source: String, target: String, spec: String) extends Statement
   final case class TemporalLiteral(kind: String, value: String)
