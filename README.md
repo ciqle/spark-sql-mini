@@ -44,6 +44,8 @@ cd ~/workspace/spark-sql-mini
 | `scored = SCORE source USING ONNX 'model.onnx' FEATURES (x1, x2) AS model_score` | 在 Spark 分区里推断并追加 `model_score`，再将结果注册成 `scored` |
 | `enriched = PIT JOIN samples WITH history ON (id = entity_id) AS OF sample_ts USING feature_ts` | 为每条样本匹配最近的历史记录，再将结果注册成 `enriched` |
 | `state = SNAPSHOT history KEY (entity_id) AS OF DATE '2026-11-07' USING effective_on` | 为每个实体选出截至指定时点的最近版本，再将结果注册成 `state` |
+| `LET cutoff = SELECT MAX(event_date) FROM events` | 执行标量查询，将结果绑定为后续 SQL 的 `:cutoff` |
+| `INCLUDE 'queries/common.sql'` | 在运行前展开脚本文件，并在此处执行其中的语句 |
 | 普通 `CREATE TABLE`、`SELECT`、`EXPLAIN` 等 | `spark.sql(originalSql)` |
 
 赋值右侧接受 `SELECT`、`SCORE`、`PIT JOIN` 或 `SNAPSHOT`。普通 `WITH ... SELECT ...` 可以直接作为原生 SQL 执行。临时视图名和写入源名使用简单英文标识符，如 `temp_1`。目标允许 `output`、`db.output` 等点分名称。普通 SQL 中的标识符、表达式和函数遵循 Spark 本身的规则。
@@ -53,6 +55,33 @@ cd ~/workspace/spark-sql-mini
 - 多条语句在同一会话中按书写顺序执行，遇到错误立即停止。整个脚本不是事务，前面成功的操作不会回滚。
 - 以分号分句，识别单/双引号、反引号、转义、行注释和嵌套块注释；保留 `/*+ ... */` 优化提示。暂不支持包含内部语句分号的 `BEGIN ... END` 等 Spark SQL 脚本块。
 - CLI 展示普通查询及独立 `SCORE`、`PIT JOIN`、`SNAPSHOT` 的结果。赋值时打印临时视图的注册信息，查询或写出会触发视图求值。
+
+## 参数化与可复用脚本
+
+```bash
+./bin/run examples/reusable/main.sql \
+  --param run_date=2026-11-08 \
+  --param input_table=raw_events
+```
+
+`--param name=value` 可以重复传入。CLI 参数是字符串，SQL 中用 `:name` 引用，用 `CAST` 转换成所需类型。表名和列名可以用 Spark 的 `IDENTIFIER(:name)` 传入。值和标识符都通过 Spark 绑定。 [Spark 参数标记](https://spark.apache.org/docs/4.2.0/sql-ref-parameter-markers.html) · [Spark IDENTIFIER 子句](https://spark.apache.org/docs/4.2.0/sql-ref-identifier-clause.html)
+
+```sql
+day_events = SELECT id, amount FROM IDENTIFIER(:input_table)
+  WHERE event_date = CAST(:run_date AS DATE);
+LET average_amount = SELECT AVG(amount) FROM day_events;
+SELECT id, amount FROM day_events WHERE amount > :average_amount ORDER BY id;
+```
+
+`LET name = SELECT ...` 执行查询并要求结果恰好是一行、一列。它也接受以 `WITH` 开头的查询。支持数值、字符串、布尔值、二进制、日期、时间戳和 `NULL`。查询结果作为 Spark 标量值绑定，从下一条语句起可用。同名 `LET` 会更新该参数，参数作用域为本次脚本运行。
+
+参数标记可用于普通 SQL、临时视图赋值中的 `SELECT`，以及 Spark 支持绑定的分区写入位置。要将动态表名用于 `SCORE`、`SNAPSHOT` 或 `PIT JOIN`，可以先用 `SELECT` 把表注册为固定名称的临时视图。
+
+`INCLUDE 'relative/path.sql'` 在出现的位置展开文件。嵌套路径相对于写下 `INCLUDE` 的文件解析。同一文件在一次运行中只展开一次，路径别名和符号链接也会按实际文件路径去重。脚本启动前会检查所有包含文件是否可读，以及包含关系是否有环。展开后的语句共享同一个 Spark 会话、临时视图和参数，并按展开顺序执行。
+
+示例先加载两天的事件，按传入日期算出当天的平均金额，再输出金额高于平均值的事件。运行 11 月 8 日会得到事件 `3`，把日期改为 `2026-11-09` 会得到事件 `5`。 [入口脚本](examples/reusable/main.sql)
+
+在 Scala 中，`mini.run(script, parameters)` 执行字符串脚本，`mini.runFile(path, parameters)` 执行文件并解析 `INCLUDE`。`parameters` 的类型是 `Map[String, Any]`，可直接传入 Spark 支持的类型。
 
 ## 分区写入
 

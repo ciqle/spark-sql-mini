@@ -40,6 +40,59 @@ class MiniSqlIntegrationTest {
   }
 
   @Test
+  def bindsScriptParametersAndQueryResultsWithinOneRun(): Unit = {
+    val value = "it's data; SELECT 99"
+    val result = engine.run("""
+      CREATE TABLE script_parameter_output (id INT, dt DATE) USING PARQUET PARTITIONED BY (dt);
+      parameter_source = SELECT CAST(:id AS INT) AS id;
+      LET chosen_day = WITH input AS (SELECT CAST(:day AS DATE) AS dt) SELECT dt FROM input;
+      LET id = SELECT id + 1 FROM IDENTIFIER(:source_table);
+      LET missing = SELECT NULL;
+      parameter_output = SELECT :id AS id;
+      INSERT parameter_output INTO TABLE script_parameter_output PARTITION (dt = :chosen_day);
+      SELECT id, CAST(dt AS STRING), :text, :missing FROM script_parameter_output;
+    """, Map("id" -> 7, "day" -> "2026-11-08", "source_table" -> "parameter_source", "text" -> value)).last
+    assertEquals(Vector(Row(8, "2026-11-08", value, null)), result.collect().toVector)
+    assertThrows(classOf[AnalysisException], () => engine.run("SELECT :chosen_day"))
+  }
+
+  @Test
+  def requiresOneScalarAndPreventsWritesInLetQueries(): Unit = {
+    engine.run("CREATE TABLE scalar_guard (id INT) USING PARQUET;")
+    Vector("SELECT 1, 2", "SELECT 1 WHERE false", "SELECT id FROM range(2)", "SELECT array(1)").foreach { query =>
+      assertThrows(classOf[IllegalArgumentException], () => engine.run(s"LET value = $query;"))
+    }
+    assertThrows(classOf[AnalysisException], () => engine.run("""
+      LET value = WITH input AS (SELECT 1 AS id) INSERT INTO scalar_guard SELECT id FROM input;
+    """))
+    assertEquals(0L, spark.table("scalar_guard").count())
+  }
+
+  @Test
+  def resolvesNestedIncludesInOrderAndRejectsBrokenGraphsBeforeExecution(): Unit = {
+    val files = Files.createDirectory(directory.resolve("scripts"))
+    val nested = Files.createDirectory(files.resolve("nested"))
+    Files.writeString(files.resolve("common.sql"), "LET total = SELECT :total + 10;")
+    Files.writeString(nested.resolve("child.sql"), "INCLUDE '../common.sql'; LET total = SELECT :total * 2;")
+    val entry = Files.writeString(files.resolve("main.sql"), """
+      LET total = SELECT :initial;
+      INCLUDE 'nested/child.sql';
+      INCLUDE './common.sql';
+      SELECT :total;
+    """)
+    assertEquals(Vector(Row(22)), engine.runFile(entry, Map("initial" -> 1)).last.collect().toVector)
+
+    Files.writeString(files.resolve("common.sql"), "INCLUDE 'main.sql';")
+    val cycle = assertThrows(classOf[IllegalArgumentException], () => engine.runFile(entry))
+    assertTrue(Vector("INCLUDE cycle", "main.sql", "child.sql", "common.sql").forall(cycle.getMessage.contains))
+
+    Files.writeString(entry, "CREATE TABLE invalid_graph_output (id INT) USING PARQUET; INCLUDE 'missing.sql';")
+    val missing = assertThrows(classOf[IllegalArgumentException], () => engine.runFile(entry))
+    assertTrue(missing.getMessage.contains("statement 2") && missing.getMessage.contains("missing.sql"))
+    assertFalse(spark.catalog.tableExists("invalid_graph_output"))
+  }
+
+  @Test
   def executesTheCompleteWorkflowAndNativeSql(): Unit = {
     val results = engine.run("""
       CREATE DATABASE tutorial;
