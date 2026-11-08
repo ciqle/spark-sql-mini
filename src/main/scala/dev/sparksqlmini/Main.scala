@@ -1,12 +1,14 @@
 package dev.sparksqlmini
 
 import java.nio.file.{Files, Paths}
-import org.apache.spark.sql.SparkSession
+import scala.util.Using
+import org.apache.spark.sql.{DataFrame, SparkSession}
 import dev.sparksqlmini.Statement._
 
 object Main {
   private val usage = "Usage: ./bin/run path/to/script.sql [--param name=value ...]"
   private val parameter = "(?s)([A-Za-z_][A-Za-z0-9_]*)=(.*)".r
+  private val explain = "(?is)^explain\\b.*".r
 
   def main(args: Array[String]): Unit = {
     require(args.nonEmpty, usage)
@@ -22,57 +24,46 @@ object Main {
     Files.createDirectories(runs)
     val runDirectory = Files.createTempDirectory(runs, "run-").toAbsolutePath
     val warehouse = runDirectory.resolve("warehouse")
-    val spark = SparkSession.builder()
+    val sessionBuilder = SparkSession.builder()
       .appName("spark-sql-mini")
       .master("local[2]")
       .config("spark.ui.enabled", "false")
       .config("spark.sql.shuffle.partitions", "2")
       .config("spark.sql.warehouse.dir", warehouse.toUri.toString)
-      .getOrCreate()
 
-    spark.sparkContext.setLogLevel("WARN")
-    println(s"Warehouse: $warehouse")
-    val engine = new MiniSql(spark)
-    val execution = new engine.Execution(parameters)
-    try {
+    Using.resource(sessionBuilder.getOrCreate()) { spark =>
+      spark.sparkContext.setLogLevel("WARN")
+      println(s"Warehouse: $warehouse")
+      val engine = new MiniSql(spark)
+      val execution = new engine.Execution(parameters)
       entries.foreach { entry =>
-        val statement = entry.statement
-        println(s"\n[${entry.file}:${entry.number}] $statement")
-        val result = execution.execute(entry)
-        statement match {
-          case AssignTemp(name, _) =>
-            println(s"Registered temp view: $name (no show/count/collect)")
-          case Let(name, _) =>
-            println(s"Bound parameter: $name")
-          case InsertTemp(source, target) =>
-            println(s"Appended $source to $target")
-          case InsertPartition(source, target, spec) =>
-            println(s"Appended $source to $target with PARTITION ($spec)")
-          case score: Score =>
-            score.view match {
-              case Some(name) => println(s"Registered scored temp view: $name")
-              case None => result.show(truncate = false)
-            }
-          case pit: PitJoin =>
-            pit.view match {
-              case Some(name) => println(s"Registered point-in-time joined temp view: $name")
-              case None => result.show(truncate = false)
-            }
-          case snapshot: Snapshot =>
-            snapshot.view match {
-              case Some(name) => println(s"Registered snapshot temp view: $name")
-              case None => result.show(truncate = false)
-            }
-          case SparkSql(sql) if sql.matches("(?is)^explain\\b.*") =>
-            // EXPLAIN is one text column; printing it directly keeps the plan readable.
-            result.collect().foreach(row => println(row.getString(0)))
-          case SparkSql(_) if result.schema.nonEmpty =>
-            result.show(truncate = false)
-          case _ => ()
-        }
+        println(s"\n[${entry.file}:${entry.number}] ${entry.statement}")
+        execution.execute(entry)(result => showResult(entry.statement, result))
       }
-    } finally {
-      spark.stop()
     }
+  }
+
+  private def showResult(statement: Statement, result: DataFrame): Unit = statement match {
+    case AssignTemp(name, _) =>
+      println(s"Registered temp view: $name (no show/count/collect)")
+    case Let(name, _) =>
+      println(s"Bound parameter: $name")
+    case InsertTemp(source, target) =>
+      println(s"Appended $source to $target")
+    case InsertPartition(source, target, spec) =>
+      println(s"Appended $source to $target with PARTITION ($spec)")
+    case score: Score => showOrReportView(result, score.view, "scored")
+    case pit: PitJoin => showOrReportView(result, pit.view, "point-in-time joined")
+    case snapshot: Snapshot => showOrReportView(result, snapshot.view, "snapshot")
+    case SparkSql(sql) if explain.matches(sql) =>
+      // EXPLAIN is one text column; printing it directly keeps the plan readable.
+      result.collect().foreach(row => println(row.getString(0)))
+    case SparkSql(_) if result.schema.nonEmpty => result.show(truncate = false)
+    case _: SparkSql | _: Include => ()
+  }
+
+  private def showOrReportView(result: DataFrame, view: Option[String], description: String): Unit = view match {
+    case Some(name) => println(s"Registered $description temp view: $name")
+    case None => result.show(truncate = false)
   }
 }

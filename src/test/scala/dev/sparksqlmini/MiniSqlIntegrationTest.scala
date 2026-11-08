@@ -355,6 +355,20 @@ class MiniSqlIntegrationTest {
   }
 
   @Test
+  def snapshotCutoffsDoNotExpandSparkVariablesIntoSql(): Unit = {
+    val session = spark.newSession()
+    session.conf.set("spark.sql.variable.substitute", "true")
+    session.conf.set("mini.snapshot.cutoff", "2026-11-07 00:00:00' + INTERVAL 1 DAY --")
+    val mini = new MiniSql(session)
+    mini.run("snapshot_input = SELECT 1 AS id, TIMESTAMP_NTZ '2026-11-07 12:00:00' AS event_ts;")
+
+    val error = assertThrows(classOf[IllegalArgumentException], () => mini.run("""
+      SNAPSHOT snapshot_input KEY (id) AS OF TIMESTAMP_NTZ '${mini.snapshot.cutoff}' USING event_ts;
+    """))
+    assertTrue(error.getMessage.contains("SNAPSHOT AS OF requires a valid date or timestamp value"))
+  }
+
+  @Test
   def reportsAnUnresolvedSnapshotTieEvenWhenCountingRows(): Unit = {
     val snapshot = engine.run("""
       tied_events = SELECT * FROM VALUES

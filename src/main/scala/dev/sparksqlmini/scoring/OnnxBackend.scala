@@ -5,6 +5,7 @@ import java.util.Collections
 import ai.onnxruntime.{NodeInfo, OnnxJavaType, OnnxTensor, OrtEnvironment, OrtSession, TensorInfo}
 import scala.jdk.CollectionConverters._
 import scala.util.Using
+import dev.sparksqlmini.scoring.ModelPredictor.closeOnFailure
 
 object OnnxBackend extends ModelBackend {
   override def open(model: Array[Byte], featureCount: Int): ModelPredictor = {
@@ -56,17 +57,6 @@ object OnnxBackend extends ModelBackend {
     case _ => throw new IllegalArgumentException(s"ONNX $role must be a tensor")
   }
 
-  // A successful predictor owns both resources until its Spark task finishes.
-  private def closeOnFailure[A](resource: AutoCloseable)(body: => A): A = {
-    try body
-    catch {
-      case error: Throwable =>
-        try resource.close()
-        catch { case closeError: Throwable if closeError ne error => error.addSuppressed(closeError) }
-        throw error
-    }
-  }
-
   private final class OnnxPredictor(
       environment: OrtEnvironment,
       session: OrtSession,
@@ -76,8 +66,10 @@ object OnnxBackend extends ModelBackend {
       featureCount: Int
   ) extends ModelPredictor {
     private val inputShape = Array(1L, featureCount.toLong)
+    private var closed = false
 
     override def predict(features: Array[Double]): Double = {
+      if (closed) throw new IllegalStateException("ONNX predictor is closed")
       require(features.length == featureCount, s"Expected $featureCount features, found ${features.length}")
       val tensorValues = Array.tabulate(featureCount) { index =>
         val value = features(index).toFloat
@@ -99,6 +91,11 @@ object OnnxBackend extends ModelBackend {
       }
     }
 
-    override def close(): Unit = Using.resource(options)(_ => session.close())
+    override def close(): Unit = {
+      if (!closed) {
+        closed = true
+        Using.resource(options)(_ => session.close())
+      }
+    }
   }
 }
