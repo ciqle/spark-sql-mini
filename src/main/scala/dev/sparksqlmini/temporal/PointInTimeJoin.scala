@@ -2,7 +2,7 @@ package dev.sparksqlmini.temporal
 
 import org.apache.spark.sql.{Column, DataFrame}
 import org.apache.spark.sql.functions.{col, lit, make_interval, monotonically_increasing_id, try_add, unix_date}
-import org.apache.spark.sql.types.{DateType, LongType}
+import org.apache.spark.sql.types.{DataType, DateType, DecimalType, DoubleType, FloatType, IntegerType, LongType}
 import dev.sparksqlmini.Statement.PitJoin
 
 private[sparksqlmini] object PointInTimeJoin {
@@ -30,9 +30,16 @@ private[sparksqlmini] object PointInTimeJoin {
     def history(name: String): Column = qualified(historyAlias, name)
 
     require(statement.keys.nonEmpty, "PIT JOIN requires at least one key pair")
+    val ansi = left.sparkSession.conf.get("spark.sql.ansi.enabled").toBoolean
     val keyMatches = statement.keys.map { case (leftKey, rightKey) =>
-      sample(field(left, leftKey, "PIT JOIN sample").name) ===
-        history(field(right, rightKey, "PIT JOIN history").name)
+      val sampleKey = field(left, leftKey, "PIT JOIN sample")
+      val historyKey = field(right, rightKey, "PIT JOIN history")
+      val sampleType = sampleKey.dataType
+      val historyType = historyKey.dataType
+      require(!canRoundKey(sampleType, historyType, ansi) && !canRoundKey(historyType, sampleType, ansi),
+        s"PIT JOIN key comparison may lose precision for '${sampleKey.name}' (${sampleType.simpleString}) " +
+          s"and '${historyKey.name}' (${historyType.simpleString}). Normalize the key types before joining.")
+      sample(sampleKey.name) === history(historyKey.name)
     }.reduce(_ && _)
     val sampleTime = sample(leftTime.name)
     val historyTime = history(rightTime.name)
@@ -65,4 +72,12 @@ private[sparksqlmini] object PointInTimeJoin {
 
   private def qualified(alias: String, name: String): Column =
     col(s"$alias.${quote(name)}")
+
+  private def canRoundKey(floatingType: DataType, otherType: DataType, ansi: Boolean): Boolean =
+    (floatingType, otherType) match {
+      // ANSI promotes INT with FLOAT to DOUBLE, where both values are exact.
+      case (FloatType, IntegerType) => !ansi
+      case (FloatType | DoubleType, LongType | _: DecimalType) => true
+      case _ => false
+    }
 }

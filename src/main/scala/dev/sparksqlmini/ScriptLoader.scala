@@ -29,6 +29,7 @@ private[sparksqlmini] object ScriptLoader {
         throw new IllegalArgumentException(s"$location: INCLUDE cycle: $chain")
       }
       if (!completed.contains(file)) {
+        require(Files.isRegularFile(file), s"$location: script '$file' must be a regular file")
         val statements = try StatementParser.parse(Files.readString(file, UTF_8))
         catch {
           case error: IOException =>

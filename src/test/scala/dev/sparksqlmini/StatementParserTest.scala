@@ -7,6 +7,15 @@ import org.junit.jupiter.api.Test
 
 class StatementParserTest {
   @Test
+  def preservesSparkDollarQuotedBodiesWithSemicolonsAndQuotes(): Unit = {
+    val tagged = "CREATE TEMPORARY FUNCTION f() RETURNS STRING LANGUAGE PYTHON AS $tag$return '; -- /* $TAG$'$tag$"
+    val untagged = "CREATE TEMPORARY FUNCTION g() RETURNS STRING LANGUAGE PYTHON AS $$return ';'$$"
+    assertEquals(Vector(SparkSql(tagged), SparkSql(untagged), SparkSql("SELECT 1")),
+      StatementParser.parse(s"$tagged; $untagged; SELECT 1;"))
+    assertThrows(classOf[IllegalArgumentException], () => StatementParser.parse("SELECT $tag$unterminated"))
+  }
+
+  @Test
   def parsesLongQuotedPathsAndColumnListsWithoutBacktracking(): Unit = {
     val includePath = "directory/" + "x" * 16000 + ".sql"
     val modelPath = "owner's-" * 4000 + "model.onnx"
