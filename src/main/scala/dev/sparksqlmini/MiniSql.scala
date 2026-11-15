@@ -42,7 +42,7 @@ final class MiniSql(val spark: SparkSession) {
     def execute(statement: Statement): DataFrame = statement match {
       case AssignTemp(name, query) =>
         val data = sql(query)
-        data.createOrReplaceTempView(name)
+        registerView(data, name)
         data
 
       case Let(name, query) =>
@@ -74,17 +74,17 @@ final class MiniSql(val spark: SparkSession) {
 
       case score: Score =>
         val data = TableScoring.score(spark.table(quote(score.source)), score)
-        score.view.foreach(data.createOrReplaceTempView)
+        score.view.foreach(name => registerView(data, name))
         data
 
       case pit: PitJoin =>
         val data = PointInTimeJoin.join(spark.table(quote(pit.left)), spark.table(quote(pit.right)), pit)
-        pit.view.foreach(data.createOrReplaceTempView)
+        pit.view.foreach(name => registerView(data, name))
         data
 
       case snapshot: Snapshot =>
         val data = TimeSnapshot.read(spark.table(quote(snapshot.source)), snapshot)
-        snapshot.view.foreach(data.createOrReplaceTempView)
+        snapshot.view.foreach(name => registerView(data, name))
         data
 
       case SparkSql(query) =>
@@ -93,6 +93,12 @@ final class MiniSql(val spark: SparkSession) {
 
     private def sql(query: String): DataFrame =
       if (parameters.isEmpty) spark.sql(query) else spark.sql(query, parameters)
+  }
+
+  private def registerView(data: DataFrame, name: String): Unit = {
+    // Quote wrapper names while preserving Spark identifier syntax from direct Scala callers.
+    val identifier = if (StatementParser.simpleIdentifier.matches(name)) quote(name) else name
+    data.createOrReplaceTempView(identifier)
   }
 
   // Wrapper identifiers are deliberately limited to simple dot-separated names.

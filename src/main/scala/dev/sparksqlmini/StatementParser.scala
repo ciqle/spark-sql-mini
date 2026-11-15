@@ -9,6 +9,7 @@ import dev.sparksqlmini.Statement._
 /** Recognizes the outer wrapper syntax; Spark remains responsible for SQL parsing. */
 object StatementParser {
   private val identifier = "[A-Za-z_][A-Za-z0-9_]*"
+  private[sparksqlmini] val simpleIdentifier = identifier.r
   private val qualifiedIdentifier = identifier + "(?:\\s*\\.\\s*" + identifier + ")*+"
   private val columnList = identifier + "(?:\\s*,\\s*" + identifier + ")*+"
   private val keyPair = identifier + "\\s*=\\s*" + identifier
@@ -215,13 +216,20 @@ object StatementParser {
         (offset < 2 || !identifierPart(script(offset - 2)))
     }
 
+    def dollarTagEnd(start: Int): Int = {
+      var end = start + 1
+      while (end < script.length &&
+        ((script(end) >= 'a' && script(end) <= 'z') || (script(end) >= 'A' && script(end) <= 'Z'))) end += 1
+      if (end < script.length && script(end) == '$') end else -1
+    }
+
     while (i < script.length) {
       val c = script(i)
       val next = if (i + 1 < script.length) script(i + 1) else '\u0000'
       if (quote != '\u0000') {
         current.append(c)
-        if (c == quote && next == quote) {
-          current.append(next) // SQL escapes a quote by doubling it, including backticks.
+        if (c == quote && next == quote && !rawLiteral) {
+          current.append(next)
           i += 2
         } else if (c == quote) {
           quote = '\u0000'
@@ -235,7 +243,13 @@ object StatementParser {
       } else if (c == '-' && next == '-') {
         current.append(' ')
         i += 2
-        while (i < script.length && script(i) != '\n' && script(i) != '\r') i += 1
+        while (i < script.length && script(i) != '\n' && script(i) != '\r') {
+          // Spark treats a backslash followed by LF as part of the comment.
+          if (script(i) == '\\' && i + 1 < script.length && script(i + 1) == '\n') {
+            current.append('\n')
+            i += 2
+          } else i += 1
+        }
       } else if (c == '/' && next == '*') {
         val start = i
         var depth = 1
@@ -257,6 +271,19 @@ object StatementParser {
         }
         require(depth == 0, s"Unterminated block comment at character ${start + 1}")
         if (isHint) current.append(script.substring(start, i))
+      } else if (c == '$') {
+        val tagEnd = dollarTagEnd(i)
+        if (tagEnd == -1) {
+          current.append(c)
+          i += 1
+        } else {
+          val tag = script.substring(i, tagEnd + 1)
+          val closing = script.indexOf(tag, tagEnd + 1)
+          require(closing >= 0, s"Unterminated dollar-quoted text at character ${i + 1}")
+          val end = closing + tag.length
+          current.append(script.substring(i, end))
+          i = end
+        }
       } else if (c == '\'' || c == '"' || c == '`') {
         quote = c
         quoteStart = i

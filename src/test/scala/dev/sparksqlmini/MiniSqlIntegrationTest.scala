@@ -40,6 +40,84 @@ class MiniSqlIntegrationTest {
   }
 
   @Test
+  def doesNotExecuteSqlInsideAContinuedLineComment(): Unit = {
+    val script = "-- continued " + "\\\n" +
+      "CREATE TABLE commented_out (id INT) USING PARQUET;\n" +
+      "SELECT 'visible';"
+
+    val expected = spark.sql(script).collect().toVector
+    assertEquals(Vector(Vector(Row("visible"))), engine.run(script).map(_.collect().toVector))
+    assertEquals(Vector(Row("visible")), expected)
+    assertFalse(spark.catalog.tableExists("commented_out"))
+  }
+
+  @Test
+  def keepsTheNextLiteralSeparateAfterARawStringCloses(): Unit = {
+    val query = "SELECT r'first''second" + "\\" + "';still second'"
+    val expected = spark.sql(query).collect().toVector
+    val results = engine.run(s"$query; SELECT 2;")
+    assertEquals(Vector(expected, Vector(Row(2))), results.map(_.collect().toVector))
+  }
+
+  @Test
+  def rejectsAnUnrepresentablePartitionDateFromTheScalaApi(): Unit = {
+    import java.time.LocalDate
+    import dev.sparksqlmini.Statement.{PartitionRange, Snapshot, TemporalLiteral}
+    engine.run("partition_dates = SELECT 1 AS id, DATE '2026-11-08' AS dt;")
+    val tooLarge = LocalDate.ofEpochDay(Int.MaxValue.toLong + 1)
+    val statement = Snapshot("partition_dates", Vector("id"), TemporalLiteral("DATE", "2026-11-08"),
+      "dt", None, None, Some(PartitionRange("dt", LocalDate.of(2026, 11, 8), tooLarge)))
+    val error = assertThrows(classOf[IllegalArgumentException], () => engine.execute(statement))
+    assertTrue(error.getMessage.contains("Spark's DATE range"))
+  }
+
+  @Test
+  def doesNotMatchDistinctPitKeysThatWouldRoundToTheSameNumber(): Unit = {
+    engine.run("""
+      precise_sample = SELECT 9007199254740993L AS id, DATE '2026-11-08' AS sample_dt;
+      approximate_history = SELECT CAST(9007199254740992L AS DOUBLE) AS id, DATE '2026-11-08' AS event_dt;
+      integral_history = SELECT 1 AS id, DATE '2026-11-08' AS event_dt;
+      integral_sample = SELECT 1L AS id, DATE '2026-11-08' AS sample_dt;
+    """)
+    val error = assertThrows(classOf[IllegalArgumentException], () => engine.run("""
+      PIT JOIN precise_sample WITH approximate_history ON (id = id) AS OF sample_dt USING event_dt;
+    """))
+    assertTrue(error.getMessage.contains("may lose precision"))
+    val matched = engine.run("""
+      PIT JOIN integral_sample WITH integral_history ON (id = id) AS OF sample_dt USING event_dt;
+    """).last
+    assertEquals(Vector(Row(1)), matched.select("history_id").collect().toVector)
+  }
+
+  @Test
+  def preservesOriginalColumnMetadataAndOrderWhenScoring(): Unit = {
+    import org.apache.spark.sql.functions.col
+    import org.apache.spark.sql.types.MetadataBuilder
+    val input = spark.sql("SELECT 1 AS x1, 2 AS x2, 3 AS id")
+    val featureMetadata = new MetadataBuilder().putString("comment", "First model feature").build()
+    val idMetadata = new MetadataBuilder().putString("comment", "Original identifier").build()
+    input.select(col("x1").as("x1", featureMetadata), col("x2"), col("id").as("id", idMetadata), col("id"))
+      .createOrReplaceTempView("annotated_score_input")
+    val output = engine.run("""
+      SCORE annotated_score_input USING ONNX 'examples/models/linear.onnx' FEATURES (x1, x2) AS prediction;
+    """).last
+    assertEquals(Vector("x1", "x2", "id", "id", "prediction"), output.columns.toVector)
+    assertEquals(featureMetadata, output.schema.fields(0).metadata)
+    assertEquals(idMetadata, output.schema.fields(2).metadata)
+    assertEquals(Vector(Row(1, 2, 3, 3, 0.5)), output.collect().toVector)
+  }
+
+  @Test
+  def allowsWrapperViewNamesUnderAnsiReservedKeywordEnforcement(): Unit = {
+    val session = spark.newSession()
+    session.conf.set("spark.sql.ansi.enabled", "true")
+    session.conf.set("spark.sql.ansi.enforceReservedKeywords", "true")
+    val mini = new MiniSql(session)
+    val results = mini.run("select = SELECT 1 AS id; SELECT id FROM `select`;")
+    assertEquals(Vector(Row(1)), results.last.collect().toVector)
+  }
+
+  @Test
   def bindsScriptParametersAndQueryResultsWithinOneRun(): Unit = {
     val value = "it's data; SELECT 99"
     val result = engine.run("""

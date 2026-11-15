@@ -28,6 +28,8 @@ private[sparksqlmini] object HistoryRows {
   def readPartitions(data: DataFrame, range: Option[PartitionRange], operation: String): DataFrame =
     range.fold(data) { bounds =>
       require(!bounds.from.isAfter(bounds.to), s"$operation partition range start must be on or before its end")
+      require(bounds.from.toEpochDay.isValidInt && bounds.to.toEpochDay.isValidInt,
+        s"$operation partition range must fit in Spark's DATE range")
       val partition = field(data, bounds.column, s"$operation partition")
       require(partition.dataType == DateType,
         s"$operation partition column '${partition.name}' must be DATE. Found ${partition.dataType.simpleString}.")

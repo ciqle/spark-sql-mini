@@ -4,7 +4,8 @@ import java.io.IOException
 import java.nio.file.{Files, InvalidPathException, Paths}
 import org.apache.spark.TaskContext
 import org.apache.spark.sql.{DataFrame, Encoders, Row}
-import org.apache.spark.sql.types.{DoubleType, NumericType, StructField}
+import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.types.{DoubleType, Metadata, NumericType, StructField}
 import dev.sparksqlmini.Statement.Score
 import dev.sparksqlmini.scoring.ModelPredictor.closeOnFailure
 
@@ -44,7 +45,7 @@ private[sparksqlmini] object TableScoring {
     val outputSchema = schema.add(StructField(outputColumn, DoubleType, nullable = false))
 
     // Spark ships the model bytes with the task. Native sessions stay inside the task.
-    input.mapPartitions { rows =>
+    val scored = input.mapPartitions { rows =>
       if (!rows.hasNext) Iterator.empty
       else {
         val task = TaskContext.get()
@@ -67,5 +68,15 @@ private[sparksqlmini] object TableScoring {
         }
       }
     }(Encoders.row(outputSchema))
+
+    if (schema.fields.forall(_.metadata == Metadata.empty)) scored
+    else {
+      // The row encoder drops column metadata. Match by position because non-feature names may repeat.
+      val names = outputSchema.fields.indices.map(index => s"_score_column_$index")
+      val restored = names.zip(outputSchema.fields).map { case (name, field) =>
+        col(name).as(field.name, field.metadata)
+      }
+      scored.toDF(names: _*).select(restored: _*)
+    }
   }
 }
